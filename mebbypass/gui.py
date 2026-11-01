@@ -15,13 +15,16 @@ ve canlı log kartı. Pencere kapatıldığında uygulama kapanmaz — tepside
 Kullanım:  python3 -m mebbypass --gui   (ya da mebbypass-gui komutu)
 """
 
+import os
+import shutil
+import subprocess
 import threading
 
 import gi
 gi.require_version("Gtk", "3.0")  # noqa: E402 (Cinnamon'un GTK3'ü)
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
-from .core import DEFAULT_PORT, LOG_FILE, Server, set_system
+from .core import DEFAULT_PORT, LOG_FILE, Server, set_system, spawn_background
 
 _CSS = b"""
 .mbp-card {
@@ -176,6 +179,14 @@ class AppWindow(Gtk.Window):
         self.sw_system.set_active(True)
         self.sw_system.set_valign(Gtk.Align.CENTER)
         grid.attach(self.sw_system, 1, 2, 1, 1)
+        auto_lbl = Gtk.Label(label="Açılışta otomatik başlat", xalign=0.0)
+        auto_lbl.set_valign(Gtk.Align.CENTER)
+        grid.attach(auto_lbl, 0, 3, 1, 1)
+        self.sw_autostart = Gtk.Switch()
+        self.sw_autostart.set_active(self._autostart_enabled())
+        self.sw_autostart.set_valign(Gtk.Align.CENTER)
+        grid.attach(self.sw_autostart, 1, 3, 1, 1)
+        self.sw_autostart.connect("state-set", self._on_autostart_toggle)
 
         # ---- Log kartı
         logcard = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -471,16 +482,116 @@ class AppWindow(Gtk.Window):
         return True  # pencere yok edilmez
 
     def on_quit(self, _w=None, *a) -> None:
-        """Tam çıkış: proxy durdurulur, ayarlar geri alınır, kapanılır."""
+        """Çıkış: proxy çalışıyorsa kullanıcıya arka planda devam seçeneği
+        sunulur; "Devam etsin" seçilirse proxy GUI'den bağımsız arka plan
+        süreci olarak sürer (tahtanın bir sonraki açılışında da otomatik
+        başlatma anahtarı devredeyse otomatik çalışır)."""
         srv = self.server
         if srv is not None:
+            dlg = Gtk.MessageDialog(
+                transient_for=self, flags=0,
+                message_type=Gtk.MessageType.QUESTION,
+                text="Proxy arka planda çalışmaya devam etsin mi?")
+            dlg.format_secondary_text(
+                "Pencere kapatılsa da tepsi simgesiyle yönetebilirsiniz.")
+            dlg.add_button("Devam etsin", 1)
+            dlg.add_button("Durdur ve çık", 2)
+            dlg.add_button("İptal", 3)
+            dlg.set_default_response(1)
+            response = dlg.run()
+            dlg.destroy()
+            port = srv.port
             self.server = None
-            try:
-                set_system(srv.port, on=False)
-            except Exception:
-                pass
-            srv.stop()
+            if response == 1:
+                # Ayarları bozmadan bırak; bağımsız süreç olarak sürdür.
+                srv.stop()
+                spawn_background(port)
+            elif response == 2:
+                try:
+                    set_system(port, on=False)
+                except Exception:
+                    pass
+                srv.stop()
+            else:
+                return  # İptal
         Gtk.main_quit()
+
+    # ------------------------------------------------ otomatik başlatma
+
+    def _autostart_enabled(self) -> bool:
+        home = os.path.expanduser("~")
+        unit = os.path.join(home, ".config", "systemd", "user",
+                            "mebbypass.service")
+        xdg = os.path.join(home, ".config", "autostart",
+                           "mebbypass-autostart.desktop")
+        return os.path.exists(unit) or os.path.exists(xdg)
+
+    def _set_autostart(self, enable: bool) -> None:
+        """Oturum açılışında otomatik başlatmayı kurar/kaldırır.
+
+        Öncelik systemd kullanıcı birimi (çökme sonrası yeniden başlatma
+        ile); systemctl --user kullanılamıyorsa XDG autostart girdisi.
+        """
+        home = os.path.expanduser("~")
+        unit_dir = os.path.join(home, ".config", "systemd", "user")
+        unit = os.path.join(unit_dir, "mebbypass.service")
+        if shutil.which("systemctl"):
+            try:
+                if enable:
+                    os.makedirs(unit_dir, exist_ok=True)
+                    exe = shutil.which("mebbypass") or "/usr/bin/mebbypass"
+                    with open(unit, "w", encoding="utf-8") as f:
+                        f.write(
+                            "[Unit]\nDescription=mebbypass proxy\n"
+                            "After=network-online.target\n\n"
+                            "[Service]\nExecStart=%s --sistem\n"
+                            "Restart=on-failure\n\n"
+                            "[Install]\nWantedBy=default.target\n" % exe)
+                    subprocess.run(
+                        ["systemctl", "--user", "daemon-reload"],
+                        capture_output=True, timeout=10)
+                    subprocess.run(
+                        ["systemctl", "--user", "enable", "mebbypass"],
+                        capture_output=True, timeout=10)
+                else:
+                    subprocess.run(
+                        ["systemctl", "--user", "disable", "mebbypass"],
+                        capture_output=True, timeout=10)
+                    try:
+                        os.remove(unit)
+                    except OSError:
+                        pass
+                    subprocess.run(
+                        ["systemctl", "--user", "daemon-reload"],
+                        capture_output=True, timeout=10)
+                return
+            except OSError:
+                pass
+        # XDG autostart yedeği
+        d = os.path.join(home, ".config", "autostart")
+        xdg = os.path.join(d, "mebbypass-autostart.desktop")
+        try:
+            if enable:
+                os.makedirs(d, exist_ok=True)
+                with open(xdg, "w", encoding="utf-8") as f:
+                    f.write(
+                        "[Desktop Entry]\nType=Application\n"
+                        "Name=mebbypass\nDescription=MEB bypass proxy\n"
+                        "Exec=mebbypass --sistem\nTerminal=false\n"
+                        "X-GNOME-Autostart-enabled=true\n")
+            else:
+                try:
+                    os.remove(xdg)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _on_autostart_toggle(self, _sw, state: bool) -> bool:
+        self._set_autostart(bool(state))
+        self._append("[gui] açılışta otomatik başlat: %s\n"
+                     % ("AÇIK" if state else "KAPALI"))
+        return False
 
     # ------------------------------------------------ log izleme
 

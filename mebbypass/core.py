@@ -26,6 +26,7 @@ import os
 import socket
 import ssl
 import struct
+import sys
 import subprocess
 import threading
 import time
@@ -951,6 +952,33 @@ class Server:
             t.join(timeout=2.0)
         self._sock = None
         self._thread = None
+
+
+# ------------------------------------------------------- arka plan süreci
+
+def spawn_background(port: int) -> int:
+    """Proxy'yi GUI'den bağımsız bir arka plan süreci olarak başlatır
+    ve yeni sürecin pid'ini döndürür.
+
+    GUI kapatılırken proxy'nin çalışmaya devam edebilmesi için kullanılır:
+    çağıran taraf önce kendi sunucusunu durdurur (ayarı geri almadan),
+    sonra bu fonksiyonla aynı portu arka planda yeniden başlatır.
+    Sürecin pid'i ~/.mebbypass/mebbypass.pid'e yazılır (dur.sh ile uyumlu).
+    """
+    args = [sys.executable, "-X", "utf8", "-m", "mebbypass",
+            "--sistem", "-p", str(port)]
+    proc = subprocess.Popen(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        d = os.path.dirname(LOG_FILE)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "mebbypass.pid"), "w",
+                  encoding="utf-8") as f:
+            f.write(str(proc.pid))
+    except OSError:
+        pass
+    return proc.pid
 
 
 # ---------------------------------------------------------------- testler

@@ -2,7 +2,7 @@
 
 # 🛰️ mebbypass
 
-[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.7.0-blue)](#)
+[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.8.0-blue)](#)
 [![python](https://img.shields.io/badge/Python-3.9%2B-informational?logo=python&logoColor=white)](https://www.python.org)
 [![platform](https://img.shields.io/badge/platform-Pardus%20ETAP%2023%20%7C%20Debian%2012-green)](#)
 [![arayüz](https://img.shields.io/badge/aray%C3%BCz-GTK3-purple)](#)
@@ -54,7 +54,7 @@ testi** (boş SNI, DoT, QUIC, ECH, IPv6…).
 ## 📦 Kurulum (.deb)
 
 `bash
-sudo dpkg -i mebbypass_1.7.0-1_all.deb
+sudo dpkg -i mebbypass_1.8.0-1_all.deb
 sudo apt-get install -f   # eksik bağımlılık varsa tamamlar
 `
 
@@ -78,13 +78,18 @@ mebbypass-gui
 - **Durum kartı** — büyük, renkli durum etiketi + gerçek port
   (otomatik yedek port düşüşü anında görünür)
 - **Basit ayarlar** — port, parça boyu ve sistem-proxy anahtarı
+- **Açılışta otomatik başlat** — tahtanın her açılışında proxy
+  kendiliğinden çalışır (systemd kullanıcı birimi; yoksa oturumun
+  otomatik başlatma girdisi kurulur)
 - **Canlı log** (`~/.mebbypass/log.txt` kuyruğu) + Temizle
 - **Teşhis Çalıştır** — rapor masaüstüne düşer
 - Pencere kapatılınca uygulama kapanmaz: **tepside (sistem tepsisi)**
   çalışmaya devam eder. Simgeye tıklayıp pencereyi geri açabilir,
   sağ tık menüsünden başlat/durdur/teşhis çalıştırabilirsiniz.
   Tam çıkış ve sistem proxy ayarının geri alınması yalnızca tepsi
-  menüsündeki **Çıkış** ile olur.
+  menüsündeki **Çıkış** ile olur. Çıkış anında proxy çalışıyorsa
+  diyalog sorar: **Devam etsin** (bağımsız arka plan süreci olarak
+  sürer, GUI kapalı olabilir) ya da **Durdur ve çık**.
 
 ## 🚀 Komut satırı
 
