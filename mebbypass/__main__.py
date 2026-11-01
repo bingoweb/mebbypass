@@ -25,8 +25,8 @@ import argparse
 import sys
 import time
 
-from .core import (DEFAULT_PORT, LISTEN_HOST, LOG_FILE, Server, run_self_test,
-                   set_system)
+from .core import (DEFAULT_PORT, LISTEN_HOST, LOG_FILE, Server, log,
+                   run_self_test, set_system)
 
 
 def main() -> None:
@@ -39,8 +39,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="mebbypass — MEB/f@tih filtrelerini sunucusuz aşan proxy "
                     "(Pardus ETAP 23)")
-    ap.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
-                    help="dinlenecek yerel port (varsayılan: 8080)")
+    ap.add_argument("-p", "--port", type=int, default=None,
+                    help="dinlenecek yerel port (varsayılan: 8080; doluysa "
+                         "otomatik yedek port seçilir: 8081, 8888, 9090, "
+                         "3128, 8443, 1080)")
     ap.add_argument("--chunk", type=int, default=8,
                     help="ClientHello parça boyutu, bayt (varsayılan: 8; "
                          "0 = parçalama kapalı)")
@@ -77,7 +79,7 @@ def main() -> None:
         return
 
     if args.geri_al:
-        set_system(args.port, on=False)
+        set_system(args.port or DEFAULT_PORT, on=False)
         print("Sistem proxy ayarları geri alındı. Tarayıcı önbelleğini "
               "boşaltıp yeni sekme açın.")
         return
@@ -85,12 +87,17 @@ def main() -> None:
     if args.test:
         sys.exit(run_self_test(args.chunk))
 
-    server = Server(port=args.port, chunk=args.chunk)
+    auto_port = args.port is None
+    requested = args.port if args.port is not None else DEFAULT_PORT
+    server = Server(port=requested, chunk=args.chunk, auto=auto_port)
     try:
         server.start()
     except OSError as e:
-        print(f"Hata: {args.port} porta bağlanılamadı: {e}", file=sys.stderr)
+        print(f"Hata: porta bağlanılamadı: {e}", file=sys.stderr)
         sys.exit(1)
+    if auto_port and server.port != requested:
+        log(f"Port {requested} dolu; otomatik yedek port kullanılıyor: "
+            f"{server.port}")
 
     if args.sistem:
         set_system(server.port, on=True)

@@ -43,9 +43,10 @@ case "${1:-start}" in
         echo $! > "$PIDF"
         sleep 1
         if is_running; then
-            echo "mebbypass başlatıldı (PID $(cat "$PIDF"), port $PORT)."
+            PORTUSED="$(cat "$DIR/port" 2>/dev/null || echo "$PORT")"
+            echo "mebbypass başlatıldı (PID $(cat "$PIDF"), port $PORTUSED)."
             echo "Tarayıcı proxy ayarı otomatik yapıldı."
-            echo "Test:  curl -x http://127.0.0.1:$PORT https://www.youtube.com"
+            echo "Test:  curl -x http://127.0.0.1:$PORTUSED https://www.youtube.com"
         else
             echo "Başlamadı. Son satırlar:"
             tail -n 8 "$DIR/nohup.out" 2>/dev/null
@@ -62,12 +63,14 @@ case "${1:-start}" in
             rm -f "$PIDF"
         fi
         # Sistem proxy ayarlarını otomatik geri al (tam kapanış).
-        "$PY" -X utf8 -m mebbypass --sistem --geri-al -p "$PORT" >/dev/null 2>&1
+        PORTUSED="$(cat "$DIR/port" 2>/dev/null || echo "$PORT")"
+        "$PY" -X utf8 -m mebbypass --sistem --geri-al -p "$PORTUSED" >/dev/null 2>&1
         echo "Tarayıcı proxy ayarı geri alındı. Yeni sekmede deneyin."
         ;;
     status)
         if is_running; then
-            echo "Çalışıyor (PID $(cat "$PIDF"), port $PORT)."
+            PORTUSED="$(cat "$DIR/port" 2>/dev/null || echo "$PORT")"
+            echo "Çalışıyor (PID $(cat "$PIDF"), port $PORTUSED)."
         else
             echo "Çalışmıyor."
         fi

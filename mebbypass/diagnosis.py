@@ -29,7 +29,7 @@ import time
 
 from . import __version__, core
 from .core import (ALLOWED_SNIS, DEFAULT_PORT, DOH_PROVIDERS, LOG_FILE,
-                   Server, try_handshake)
+                   PORT_CANDIDATES, Server, port_in_use, try_handshake)
 
 # Kamufle keşfi bu hedef sitelerle de sınanır.
 PROBE_TARGETS = [
@@ -346,6 +346,11 @@ def run_diagnosis(progress=None) -> str:
     record("Ortam", "8080 portu boş mu?", port8080_free,
            "boş" if port8080_free else "DOLU — mebbypass zaten çalışıyor "
            "veya başka program kullanıyor")
+    ports_state = ", ".join(
+        "%d=%s" % (p, "boş" if not port_in_use(p) else "dolu")
+        for p in PORT_CANDIDATES)
+    record("Ortam", "Yedek port adayları (8080 doluysa otomatik seçim)",
+           True, ports_state)
     record("Ortam", "gsettings", _which("gsettings") != "bulunamadı",
            _which("gsettings"))
     record("Ortam", "firefox", _which("firefox") != "bulunamadı",
@@ -648,8 +653,9 @@ def run_diagnosis(progress=None) -> str:
                     "domain'lere göre ALLOWED_SNIS güncellenmeli.")
     if not port8080_free:
         recs.append("8080 portu kullanımda: mebbypass muhtemelen hâlâ "
-                    "çalışıyor; yeni teşhis için farklı port kullanın "
-                    "(-p 9090).")
+                    "çalışıyor. mebbypass otomatik yedek porta düşer "
+                    "(8081, 8888, 9090, 3128, 8443, 1080); yeni teşhis "
+                    "için farklı port kullanın (-p 9090).")
     if udp53_ok:
         recs.append("UDP 53 dışarı açık: sistem DNS filtresi devre dışı "
                     "kalabilir; mebbypass DoH'un yedek yolu olarak dış "

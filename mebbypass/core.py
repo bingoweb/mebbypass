@@ -33,6 +33,7 @@ import urllib.parse
 
 LISTEN_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
+PORT_CANDIDATES = [8080, 8081, 8888, 9090, 3128, 8443, 1080]
 BUF_SIZE = 65536
 CONNECT_TIMEOUT = 10.0
 BLOCK_PROBE_TIMEOUT = 6.0
@@ -678,6 +679,33 @@ def set_system(port: int, on: bool) -> None:
 
 # ---------------------------------------------------------------- sunucu
 
+def _set_bind_opts(s: socket.socket) -> None:
+    """Dinleyici soketinin bağlama seçenekleri (platform duyarlı).
+
+    Windows'ta SO_EXCLUSIVEADDRUSE çift bağlamayı engeller — böylece
+    "port dolu" tespiti ve otomatik yedek port düşüşü doğru çalışır.
+    Linux'ta (Pardus) SO_REUSEADDR hızlı yeniden başlatmayı sağlar.
+    """
+    if os.name == "nt":
+        excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if excl is not None:
+            s.setsockopt(socket.SOL_SOCKET, excl, 1)
+    else:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
+def port_in_use(port: int) -> bool:
+    """Portun gerçekten boş olup olmadığını dener (platform duyarlı)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _set_bind_opts(s)
+    try:
+        s.bind((LISTEN_HOST, port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
 class Server:
     """Dinleyiciyi arka planda yöneten sarmalayıcı (GUI ve CLI ortak kullanır).
 
@@ -686,8 +714,15 @@ class Server:
     self.port gerçek porta güncellenir (teşhis testleri bunu kullanır).
     """
 
-    def __init__(self, port: int = DEFAULT_PORT, chunk: int = 8) -> None:
+    def __init__(self, port: int = DEFAULT_PORT, chunk: int = 8,
+                 auto: bool = False) -> None:
+        """auto=True ise tercih edilen port doluysa PORT_CANDIDATES
+        adayları sırayla denenir; son çare çekirdek boş bir port seçer
+        (port=0). Pardus ETAP akıllı tahtalarda 8080 diğer okul
+        yazılımları tarafından kullanılabildiği için gereklidir.
+        """
         self.port = port
+        self.auto = auto
         self.chunk = chunk
         self._sock = None
         self._running = False
@@ -700,18 +735,50 @@ class Server:
     def start(self) -> "Server":
         if self._running:
             return self
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((LISTEN_HOST, self.port))
-        if self.port == 0:
-            self.port = s.getsockname()[1]
+        ports = [self.port]
+        if self.auto:
+            ports += [c for c in PORT_CANDIDATES if c != self.port]
+            ports.append(0)  # son çare: çekirdek boş port seçer
+        s = None
+        err = None
+        for p in ports:
+            cand = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            _set_bind_opts(cand)
+            try:
+                cand.bind((LISTEN_HOST, p))
+            except OSError as e:
+                err = e
+                try:
+                    cand.close()
+                except OSError:
+                    pass
+                continue
+            s = cand
+            if p == 0:
+                p = s.getsockname()[1]
+            self.port = p
+            break
+        if s is None:
+            raise OSError(f"Tüm port adayları dolu: {ports} ({err})")
         s.listen(64)
         s.settimeout(0.5)
         self._sock = s
         self._running = True
+        self._write_port_file()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
+
+    def _write_port_file(self) -> None:
+        """Gerçek dinleme portunu ~/.mebbypass/port dosyasına yazar;
+        mebbypass-dur ve teşhis sistemi okur."""
+        try:
+            d = os.path.dirname(LOG_FILE)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "port"), "w", encoding="utf-8") as f:
+                f.write(str(self.port))
+        except OSError:
+            pass
 
     def _loop(self) -> None:
         while self._running:
@@ -729,6 +796,10 @@ class Server:
         try:
             if self._sock is not None:
                 self._sock.close()
+        except OSError:
+            pass
+        try:
+            os.remove(os.path.join(os.path.dirname(LOG_FILE), "port"))
         except OSError:
             pass
         t = self._thread

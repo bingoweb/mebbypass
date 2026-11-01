@@ -261,7 +261,8 @@ class AppWindow(Gtk.Window):
 
     def _worker_start(self, port: int, chunk: int, sistem: bool) -> None:
         try:
-            srv = Server(port=port, chunk=chunk)
+            # Otomatik yedek port: seçilen port doluysa adaylar denenir.
+            srv = Server(port=port, chunk=chunk, auto=True)
             srv.start()
         except OSError as e:
             GLib.idle_add(self._show_error,
@@ -272,11 +273,15 @@ class AppWindow(Gtk.Window):
         if sistem:
             set_system(srv.port, on=True)
         self.server = srv
-        GLib.idle_add(self._after_start, srv.port)
+        GLib.idle_add(self._after_start, srv.port, srv.port != port)
 
-    def _after_start(self, port: int) -> bool:
+    def _after_start(self, port: int, fell_back: bool = False) -> bool:
         self.status.set_text(
             "Durum: ÇALIŞIYOR — http://127.0.0.1:%d" % port)
+        if fell_back:
+            self.port.set_value(port)
+            self._append("[gui] seçilen port dolu; otomatik yedek port "
+                         "kullanılıyor: %d\n" % port)
         self.btn_start.set_sensitive(False)
         self.btn_stop.set_sensitive(True)
         self._sync_menu()

@@ -2,7 +2,7 @@
 
 # 🛰️ mebbypass
 
-[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.3.0-blue)](#)
+[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.5.0-blue)](#)
 [![python](https://img.shields.io/badge/Python-3.9%2B-informational?logo=python&logoColor=white)](https://www.python.org)
 [![platform](https://img.shields.io/badge/platform-Pardus%20ETAP%2023%20%7C%20Debian%2012-green)](#)
 [![arayüz](https://img.shields.io/badge/aray%C3%BCz-GTK3-purple)](#)
@@ -45,14 +45,16 @@ fragmentation — with a GTK interface, self-diagnostics and an installable
 | 🎭 | **SNI kamufle** | Bağlantı gerçek IP'ye kurulur; TLS ClientHello'daki SNI, MEB'de izinli bir domain (WhatsApp/Google/MEB…) olarak gönderilir. CDN'ler uyumsuz SNI'yı kabul ettiği için **sertifika yüklemeye gerek yoktur** |
 | ✂️ | **ClientHello parçalama** | DPI'yı şaşırtmak için ilk TLS kaydı 8 baytlık segmentlere bölünür |
 
-Ayrıca: GTK3 **grafik arayüzü**, **otomatik teşhis sistemi** (masaüstüne
-Markdown rapor yazar), **gsettings/Firefox entegrasyonu** ve 8 adım
-**deneysel tekni̇k testi** (boş SNI, DoT, QUIC, ECH, IPv6…).
+Ayrıca: GTK3 **grafik arayüzü** (tepsi desteğiyle), **otomatik teşhis
+sistemi** (masaüstüne Markdown rapor yazar), **gsettings/Firefox
+entegrasyonu**, **otomatik yedek port** (8080 doluysa 8081, 8888,
+9090, 3128, 8443, 1080 sırayla denenir) ve 8 adım **deneysel tekni̇k
+testi** (boş SNI, DoT, QUIC, ECH, IPv6…).
 
 ## 📦 Kurulum (.deb)
 
 `bash
-sudo dpkg -i mebbypass_1.3.0-1_all.deb
+sudo dpkg -i mebbypass_1.5.0-1_all.deb
 sudo apt-get install -f   # eksik bağımlılık varsa tamamlar
 `
 
@@ -92,6 +94,13 @@ mebbypass --test         # hızlı kendini testi
 mebbypass --tani         # otomatik teşhis → masaüstüne MD rapor
 mebbypass --sistem --geri-al   # sistem proxy ayarlarını geri al
 `
+
+**Port otomatik seçimi:** Varsayılan 8080 doluysa (akıllı tahtalarda
+başka okul yazılımları kullanabilir) mebbypass otomatik olarak yedek
+adayları dener: 8081 → 8888 → 9090 → 3128 → 8443 → 1080; hepsi doluysa
+çekirdek boş bir port seçer. Seçilen gerçek port `~/.mebbypass/port`
+dosyasına yazılır; GUI ve `mebbypass-dur` bunu doğru gösterir.
+Sistem proxy ayarı da daima **gerçek** portla yapılır.
 
 Tarayıcıda proxy: **127.0.0.1 : 8080 (HTTP)** — `--sistem` ile otomatik.
 Test: `curl -x http://127.0.0.1:8080 https://www.youtube.com`
