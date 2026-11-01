@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q >/dev/null 2>&1 || true
+    fi
+fi
+
+echo "mebbypass kuruldu."
+echo "  Grafik arayüz  : Uygulamalar menüsünde 'mebbypass' veya 'mebbypass-gui'"
+echo "  Komut satırı   : python3 -m mebbypass --sistem"
+echo "  Otomatik teşhis: python3 -m mebbypass --tani   (rapor masaüstüne)"

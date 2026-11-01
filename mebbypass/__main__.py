@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mebbypass komut satırı arayüzü
+==============================
+
+Çekirdek mebbypass.core modülündedir; bu sarmalayıcı yalnızca
+argümanları çözümleyip uygun akışı çağırır.
+
+Kullanım:
+  python3 -m mebbypass              # 127.0.0.1:8080'de dinler
+  python3 -m mebbypass -p 8888      # farklı port
+  python3 -m mebbypass --sistem     # ayrıca Firefox + Cinnamon proxy'ini ayarlar
+  python3 -m mebbypass --sistem --geri-al   # tarayıcı/masaüstü proxy'ini geri alır
+  python3 -m mebbypass --test       # internete çıkış testleri (DoH + SNI)
+  python3 -m mebbypass --tani       # otomatik teşhis: raporu masaüstüne yazar
+  python3 -m mebbypass --gui        # GTK arayüzünü başlat
+  python3 -m mebbypass --chunk 0    # parçalamayı kapat
+
+Tarayıcıda proxy: 127.0.0.1 : 8080 (HTTP)
+Test:  curl -x http://127.0.0.1:8080 https://www.youtube.com
+"""
+
+import argparse
+import sys
+import time
+
+from .core import (DEFAULT_PORT, LISTEN_HOST, LOG_FILE, Server, run_self_test,
+                   set_system)
+
+
+def main() -> None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
+    ap = argparse.ArgumentParser(
+        description="mebbypass — MEB/f@tih filtrelerini sunucusuz aşan proxy "
+                    "(Pardus ETAP 23)")
+    ap.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
+                    help="dinlenecek yerel port (varsayılan: 8080)")
+    ap.add_argument("--chunk", type=int, default=8,
+                    help="ClientHello parça boyutu, bayt (varsayılan: 8; "
+                         "0 = parçalama kapalı)")
+    ap.add_argument("--sistem", action="store_true",
+                    help="başlatırken Firefox + masaüstü proxy'ini otomatik ayarla")
+    ap.add_argument("--geri-al", action="store_true",
+                    help="proxy'yi kapatıp sistem ayarlarını geri al")
+    ap.add_argument("--test", action="store_true",
+                    help="bağlantı testlerini çalıştır ve çık")
+    ap.add_argument("--tani", "--teshis", action="store_true",
+                    help="otomatik teşhisi çalıştır, Markdown raporunu "
+                         "masaüstüne yaz ve çık")
+    ap.add_argument("--gui", action="store_true",
+                    help="GTK arayüzünü başlat")
+    args = ap.parse_args()
+
+    if args.gui:
+        try:
+            from .gui import run
+        except ImportError as e:
+            print("GTK arayüzü kullanılamıyor: %s" % e)
+            print("PyGObject/GTK3 kurulu mu?  "
+                  "apt install python3-gi gir1.2-gtk-3.0")
+            print("Komut satırı hâlâ kullanılabilir: python3 -m mebbypass")
+            sys.exit(1)
+        run()
+        return
+
+    if args.tani:
+        from .diagnosis import run_diagnosis
+        path = run_diagnosis()
+        print("\nTeşhis raporu yazıldı: %s" % path)
+        print("Hata bildirirken bu dosyayı sohbete geri gönderebilirsiniz.")
+        return
+
+    if args.geri_al:
+        set_system(args.port, on=False)
+        print("Sistem proxy ayarları geri alındı. Tarayıcı önbelleğini "
+              "boşaltıp yeni sekme açın.")
+        return
+
+    if args.test:
+        sys.exit(run_self_test(args.chunk))
+
+    server = Server(port=args.port, chunk=args.chunk)
+    try:
+        server.start()
+    except OSError as e:
+        print(f"Hata: {args.port} porta bağlanılamadı: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.sistem:
+        set_system(server.port, on=True)
+    else:
+        print("İpucu: tarayıcı proxy'sini otomatik ayarlamak için "
+              "'--sistem' ile başlatın.")
+
+    print(r"""
+  ┌──────────────────────────────────────────────────────┐
+  │  mebbypass — MEB/f@tih bypass proxy                  │
+  │  Katmanlar: DoH DNS + SNI kamufle + CH parçalama     │
+  └──────────────────────────────────────────────────────┘
+    """)
+    print(f"Dinleniyor : http://{LISTEN_HOST}:{server.port}")
+    print(f"Parça boyu : {args.chunk} bayt"
+          + (" (kapalı)" if args.chunk == 0 else ""))
+    print(f"Log        : {LOG_FILE}")
+    print("\nTarayıcıda HTTP proxy olarak 127.0.0.1:%d gösterin." % server.port)
+    print(f"Test:  curl -x http://{LISTEN_HOST}:{server.port} "
+          "https://www.youtube.com\n")
+    print("Durdurmak için Ctrl+C  (sistem ayarları korunur; geri almak için "
+          "'--sistem --geri-al')")
+    print("-" * 60)
+
+    try:
+        while server.running:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("\nKapatılıyor...")
+    finally:
+        server.stop()
+
+
+if __name__ == "__main__":
+    main()

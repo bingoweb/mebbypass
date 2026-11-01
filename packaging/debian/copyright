@@ -1,0 +1,11 @@
+Format: https://opensource.org/license/mit
+Upstream-Name: mebbypass
+Source: yerel geliştirme
+
+Files: *
+Copyright: 2026 Taylan Soylu
+License: MIT
+ mebbypass özgür yazılımdır; MIT lisans koşullarıyla dağıtılabilir ve
+ değiştirilebilir. Lisansın tam metni LICENSE dosyasında ve
+ https://opensource.org/license/mit adresindedir.
+ Bu araç okul ağı için tasarlanmıştır; sorumluluk bilinciyle kullanın.

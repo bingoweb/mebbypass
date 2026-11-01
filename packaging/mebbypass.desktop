@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=mebbypass
+GenericName=MEB Ağ Bypass Proxy
+Comment=MEB/f@tih filtrelerini aşan yerel proxy (GTK arayüz)
+Exec=/usr/bin/mebbypass-gui
+Terminal=false
+Categories=Network;
+Keywords=meb;proxy;tahta;fatih;
+StartupNotify=true

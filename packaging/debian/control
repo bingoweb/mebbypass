@@ -1,0 +1,14 @@
+Package: mebbypass
+Version: @VERSION@-1
+Section: net
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), python3-gi, gir1.2-gtk-3.0
+Recommends: firefox-esr | firefox, gir1.2-xapp-1.0
+Maintainer: talvora <talvora@local>
+Description: MEB/f@tih okul ağı filtrelerini aşan sunucusuz yerel proxy
+ MEB/f@tih okul ağlarında SNI tabanlı filtrelemeyi aşan, üç katmanlı
+ (DoH DNS + SNI kamufle + ClientHello parçalama) yerel HTTP proxy.
+ Pardus ETAP 23 akıllı tahtalarda doğrudan çalışır; sunucu gerektirmez
+ ve yalnızca Python standart kitaplığını kullanır. GTK3 arayüzü ve
+ masaüstüne rapor yazan otomatik teşhis sistemi içerir.
