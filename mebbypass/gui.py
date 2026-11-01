@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mebbypass GTK arayüzü (Cinnamon/GTK3)
-=====================================
+mebbypass modern GTK arayüzü (Cinnamon/GTK3)
+============================================
 
 Pardus ETAP 23'te yüklü olan GTK3 + PyGObject kullanır (pip gerekmez).
 
-Davranış: pencere kapatıldığında uygulama kapanmaz — tepside (system
-tray) çalışmaya devam eder. Tepsi simgesine tıklayınca pencere geri
-açılır; menüden başlat/durdur/teşhis yönetilir. Tam çıkış yalnızca
-tepsi menüsündeki "Çıkış" ile yapılır; çıkışta proxy durdurulup sistem
-proxy ayarı geri alınır (mebbypass-dur.sh stop ile aynı davranış).
+Tasarım: başlık çubuğunda Başlat/Durdur/Teşhis, içeride büyük renkli
+durum kartı, kompakt ayarlar (port, parça boyu, sistem-proxy anahtarı)
+ve canlı log kartı. Pencere kapatıldığında uygulama kapanmaz — tepside
+(system tray) çalışmaya devam eder; tam çıkış yalnızca tepsi menüsündeki
+"Çıkış" ile yapılır (proxy durdurulur, sistem proxy ayarı geri alınır).
 
 Kullanım:  python3 -m mebbypass --gui   (ya da mebbypass-gui komutu)
 """
@@ -19,9 +19,57 @@ import threading
 
 import gi
 gi.require_version("Gtk", "3.0")  # noqa: E402 (Cinnamon'un GTK3'ü)
-from gi.repository import GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from .core import DEFAULT_PORT, LOG_FILE, Server, set_system
+
+_CSS = b"""
+.mbp-card {
+  border-radius: 12px;
+  background-color: alpha(currentColor, 0.05);
+  border: 1px solid alpha(currentColor, 0.12);
+  padding: 14px 16px;
+}
+.mbp-pill {
+  border-radius: 999px;
+  padding: 3px 14px;
+  font-weight: bold;
+}
+.mbp-run { background-color: #26a269; color: #ffffff; }
+.mbp-stop { background-color: alpha(currentColor, 0.22); }
+.mbp-big { font-size: 24px; font-weight: bold; }
+.mbp-sub { font-size: 11px; }
+.mbp-mono {
+  font-family: monospace;
+  font-size: 10px;
+}
+.mbp-title { font-weight: bold; }
+"""
+
+
+def _load_css() -> None:
+    try:
+        prov = Gtk.CssProvider()
+        prov.load_from_data(_CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    except Exception:
+        pass  # tema CSS'i verilemezse arayüz yine çalışır
+
+
+def _icon_btn(text: str, icon: str) -> Gtk.Button:
+    """İkon + metin etiketli düğme (ikon tema eksikse yalnız metin)."""
+    b = Gtk.Button()
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    try:
+        img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        box.pack_start(img, False, False, 0)
+    except Exception:
+        pass
+    box.pack_start(Gtk.Label(label=text), False, False, 0)
+    b.add(box)
+    return b
 
 
 def _make_icon_pixbuf(size: int = 24):
@@ -46,62 +94,106 @@ def _make_icon_pixbuf(size: int = 24):
 
 class AppWindow(Gtk.Window):
     def __init__(self) -> None:
-        super().__init__(title="mebbypass — MEB/f@tih bypass proxy")
+        super().__init__(title="mebbypass")
         self.server = None
         self._log_offset = 0
         self._hidden_hinted = False
-        self.set_default_size(680, 470)
+        self.set_default_size(580, 500)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("destroy", self.on_quit)
         self.connect("delete-event", self.on_delete_event)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        outer.set_border_width(10)
+        # ---- Başlık çubuğu: kontroller tek satırda
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_title("mebbypass")
+        header.set_subtitle("MEB/f@tih bypass proxy")
+        self.btn_start = _icon_btn("Başlat", "media-playback-start-symbolic")
+        self.btn_start.connect("clicked", self.on_start)
+        header.pack_start(self.btn_start)
+        self.btn_stop = _icon_btn("Durdur", "media-playback-stop-symbolic")
+        self.btn_stop.connect("clicked", self.on_stop)
+        header.pack_start(self.btn_stop)
+        self.btn_stop.set_sensitive(False)
+        self.btn_tani = _icon_btn("Teşhis", "system-search-symbolic")
+        self.btn_tani.connect("clicked", self.on_tani)
+        header.pack_end(self.btn_tani)
+        self.set_titlebar(header)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_margin_top(14)
+        outer.set_margin_bottom(14)
+        outer.set_margin_start(16)
+        outer.set_margin_end(16)
         self.add(outer)
 
-        # Durum etiketi
-        self.status = Gtk.Label(label="Durum: durduruldu")
-        self.status.set_xalign(0.0)
-        outer.pack_start(self.status, False, False, 0)
+        # ---- Durum kartı
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("mbp-card")
+        outer.pack_start(card, False, False, 0)
+        self.pill = Gtk.Label(label="● KAPALI")
+        self.pill.get_style_context().add_class("mbp-pill")
+        self.pill.get_style_context().add_class("mbp-stop")
+        pill_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        pill_box.pack_start(self.pill, False, False, 0)
+        card.pack_start(pill_box, False, False, 0)
+        self.status_big = Gtk.Label(label="Durduruldu")
+        self.status_big.get_style_context().add_class("mbp-big")
+        self.status_big.set_xalign(0.0)
+        card.pack_start(self.status_big, False, False, 0)
+        self.status_sub = Gtk.Label(
+            label="Başlat'a basın — 8080 doluysa yedek port otomatik seçilir")
+        self.status_sub.get_style_context().add_class("mbp-sub")
+        self.status_sub.get_style_context().add_class("dim-label")
+        self.status_sub.set_xalign(0.0)
+        self.status_sub.set_wrap(True)
+        card.pack_start(self.status_sub, False, False, 0)
 
-        # Ayar ızgarası
-        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
-        outer.pack_start(grid, False, False, 0)
-
-        grid.attach(Gtk.Label(label="Port:"), 0, 0, 1, 1)
+        # ---- Ayarlar kartı
+        settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        settings.get_style_context().add_class("mbp-card")
+        outer.pack_start(settings, False, False, 0)
+        st_title = Gtk.Label(label="Ayarlar")
+        st_title.get_style_context().add_class("mbp-title")
+        st_title.set_xalign(0.0)
+        settings.pack_start(st_title, False, False, 0)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        settings.pack_start(grid, False, False, 0)
+        grid.attach(Gtk.Label(label="Port", xalign=0.0), 0, 0, 1, 1)
         self.port = Gtk.SpinButton.new_with_range(1024, 65535, 1)
         self.port.set_value(DEFAULT_PORT)
+        self.port.set_width_chars(9)
         grid.attach(self.port, 1, 0, 1, 1)
-
-        grid.attach(Gtk.Label(label="Parça boyu (bayt, 0=kapalı):"),
-                    2, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Parça boyu (bayt, 0=kapalı)", xalign=0.0),
+                    0, 1, 1, 1)
         self.chunk = Gtk.SpinButton.new_with_range(0, 64, 1)
         self.chunk.set_value(8)
-        grid.attach(self.chunk, 3, 0, 1, 1)
+        grid.attach(self.chunk, 1, 1, 1, 1)
+        sys_lbl = Gtk.Label(label="Sistem proxy'sini ayarla", xalign=0.0)
+        sys_lbl.set_valign(Gtk.Align.CENTER)
+        grid.attach(sys_lbl, 0, 2, 1, 1)
+        self.sw_system = Gtk.Switch()
+        self.sw_system.set_active(True)
+        self.sw_system.set_valign(Gtk.Align.CENTER)
+        grid.attach(self.sw_system, 1, 2, 1, 1)
 
-        self.chk_system = Gtk.CheckButton(
-            label="Sistem proxy'ini otomatik ayarla")
-        self.chk_system.set_active(True)
-        grid.attach(self.chk_system, 0, 1, 2, 1)
-
-        # Düğmeler
-        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        outer.pack_start(buttons, False, False, 0)
-        self.btn_start = Gtk.Button(label="Başlat")
-        self.btn_start.connect("clicked", self.on_start)
-        buttons.pack_start(self.btn_start, False, False, 0)
-        self.btn_stop = Gtk.Button(label="Durdur")
-        self.btn_stop.connect("clicked", self.on_stop)
-        buttons.pack_start(self.btn_stop, False, False, 0)
-        self.btn_stop.set_sensitive(False)  # henüz çalışmıyor
-        self.btn_tani = Gtk.Button(label="Teşhis Çalıştır")
-        self.btn_tani.connect("clicked", self.on_tani)
-        buttons.pack_start(self.btn_tani, False, False, 0)
-
-        # Log görüntüleyici
+        # ---- Log kartı
+        logcard = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        logcard.get_style_context().add_class("mbp-card")
+        outer.pack_start(logcard, True, True, 0)
+        log_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        log_title = Gtk.Label(label="Canlı Log")
+        log_title.get_style_context().add_class("mbp-title")
+        log_title.set_xalign(0.0)
+        log_head.pack_start(log_title, False, False, 0)
+        log_hint = Gtk.Label(label="Pencere kapatınca tepside sürer")
+        log_hint.get_style_context().add_class("dim-label")
+        log_head.pack_start(log_hint, False, False, 0)
+        logcard.pack_start(log_head, False, False, 0)
         self.log_view = Gtk.TextView()
         self.log_view.set_editable(False)
         self.log_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.log_view.get_style_context().add_class("mbp-mono")
         try:
             self.log_view.override_font(Pango.FontDescription("Monospace 9"))
         except AttributeError:
@@ -110,32 +202,21 @@ class AppWindow(Gtk.Window):
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.set_shadow_type(Gtk.ShadowType.IN)
         sw.add(self.log_view)
-        outer.pack_start(sw, True, True, 0)
-
-        foot = Gtk.Label(
-            label="Log dosyası: " + LOG_FILE +
-                  "\nPencereyi kapatınca uygulama tepside çalışmaya devam "
-                  "eder.\nTam çıkış: tepsi simgesine sağ tık > Çıkış "
-                  "(proxy durdurulup ayarlar geri alınır).")
-        foot.set_xalign(0.0)
-        outer.pack_start(foot, False, False, 0)
+        logcard.pack_start(sw, True, True, 0)
+        clear_btn = Gtk.Button(label="Temizle")
+        clear_btn.connect("clicked", self._on_clear_log)
+        log_head.pack_end(clear_btn, False, False, 0)
 
         self.tray = None
         self._setup_tray()
 
-        self._append("mebbypass arayüzü hazır. Başlat düğmesine basın.\n")
+        self._append("mebbypass arayüzü hazır. Başlat'a basın.\n")
         GLib.timeout_add(1500, self._poll_log)
 
     # ------------------------------------------------ tepsi (system tray)
 
     def _setup_tray(self) -> None:
-        """Tepsi simgesini kurar: önce XApp (Cinnamon), yoksa Gtk.StatusIcon.
-
-        İkisi de başarısız olursa pencere kapatıldığında uygulama yine
-        arka planda çalışır; tekrar açmak için mebbypass-gui tekrar
-        başlatılabilir (ikinci örnek mevcut sunucuya bağlanmaz; yalnızca
-        pencere sağlar).
-        """
+        """Tepsi simgesini kurar: önce XApp (Cinnamon), yoksa Gtk.StatusIcon."""
         self.tray_menu = self._build_tray_menu()
         tray = None
         try:
@@ -253,6 +334,48 @@ class AppWindow(Gtk.Window):
         except Exception:
             pass
 
+    # ------------------------------------------------ durum göstergesi
+
+    def _pill_set(self, running: bool) -> None:
+        sc = self.pill.get_style_context()
+        if running:
+            self.pill.set_text("● ÇALIŞIYOR")
+            sc.remove_class("mbp-stop")
+            sc.add_class("mbp-run")
+        else:
+            self.pill.set_text("● KAPALI")
+            sc.remove_class("mbp-run")
+            sc.add_class("mbp-stop")
+
+    def _set_running(self, port: int, sistem: bool) -> None:
+        self.status_big.set_text("Çalışıyor")
+        self.status_sub.set_text(
+            "http://127.0.0.1:%d · sistem proxy'si %s"
+            % (port, "AÇIK" if sistem else "KAPALI"))
+        self._pill_set(True)
+        self.btn_start.set_sensitive(False)
+        self.btn_stop.set_sensitive(True)
+        self.port.set_sensitive(False)
+        self.chunk.set_sensitive(False)
+        self.sw_system.set_sensitive(False)
+        self._sync_menu()
+        self._sync_tray_tooltip()
+
+    def _set_stopped(self, note: str = "") -> None:
+        self.status_big.set_text("Durduruldu")
+        sub = "Başlat'a basın — 8080 doluysa yedek port otomatik seçilir"
+        if note:
+            sub = note
+        self.status_sub.set_text(sub)
+        self._pill_set(False)
+        self.btn_start.set_sensitive(True)
+        self.btn_stop.set_sensitive(False)
+        self.port.set_sensitive(True)
+        self.chunk.set_sensitive(True)
+        self.sw_system.set_sensitive(True)
+        self._sync_menu()
+        self._sync_tray_tooltip()
+
     # ------------------------------------------------ GUI iş parçacığı
 
     def on_start(self, _w) -> None:
@@ -260,7 +383,7 @@ class AppWindow(Gtk.Window):
         # GTK3: widget değerleri ana iş parçacığında okunmalıdır.
         port = int(self.port.get_value())
         chunk = int(self.chunk.get_value())
-        sistem = self.chk_system.get_active()
+        sistem = self.sw_system.get_active()
         threading.Thread(target=self._worker_start,
                          args=(port, chunk, sistem), daemon=True).start()
 
@@ -271,32 +394,28 @@ class AppWindow(Gtk.Window):
             srv.start()
         except OSError as e:
             GLib.idle_add(self._show_error,
-                          "Başlatılamadı: %s\n\nPort dolu olabilir; "
-                          "farklı bir port deneyin." % e)
+                          "Başlatılamadı: %s\n\nTüm aday portlar dolu "
+                          "görünüyor." % e)
             GLib.idle_add(self._after_start_error)
             return
         if sistem:
             set_system(srv.port, on=True)
         self.server = srv
-        GLib.idle_add(self._after_start, srv.port, srv.port != port)
+        GLib.idle_add(self._after_start, srv.port, sistem, srv.port != port)
 
-    def _after_start(self, port: int, fell_back: bool = False) -> bool:
-        self.status.set_text(
-            "Durum: ÇALIŞIYOR — http://127.0.0.1:%d" % port)
+    def _after_start(self, port: int, sistem: bool = True,
+                     fell_back: bool = False) -> bool:
+        self._set_running(port, sistem)
+        self.port.set_value(port)
         if fell_back:
-            self.port.set_value(port)
             self._append("[gui] seçilen port dolu; otomatik yedek port "
                          "kullanılıyor: %d\n" % port)
-        self.btn_start.set_sensitive(False)
-        self.btn_stop.set_sensitive(True)
-        self._sync_menu()
-        self._sync_tray_tooltip()
         self._append("[gui] proxy başlatıldı (port %d)\n" % port)
         return False
 
     def _after_start_error(self) -> bool:
-        self.btn_start.set_sensitive(True)
-        self._sync_menu()
+        self._set_stopped("Başlatılamadı — ayrıntılar için Hata iletisine "
+                          "bakın")
         return False
 
     def on_stop(self, _w) -> None:
@@ -314,11 +433,7 @@ class AppWindow(Gtk.Window):
         GLib.idle_add(self._after_stop)
 
     def _after_stop(self) -> bool:
-        self.status.set_text("Durum: durduruldu (sistem proxy geri alındı)")
-        self.btn_start.set_sensitive(True)
-        self.btn_stop.set_sensitive(False)
-        self._sync_menu()
-        self._sync_tray_tooltip()
+        self._set_stopped("Durduruldu — sistem proxy ayarları geri alındı")
         self._append("[gui] proxy durduruldu, sistem ayarları geri alındı\n")
         return False
 
@@ -381,6 +496,15 @@ class AppWindow(Gtk.Window):
             self._append(data)
         return True  # zamanlayıcı sürsün
 
+    def _on_clear_log(self, _w=None) -> None:
+        self.log_view.get_buffer().set_text("")
+        try:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(0, 2)
+                self._log_offset = f.tell()
+        except OSError:
+            pass
+
     def _append(self, text: str) -> None:
         buf = self.log_view.get_buffer()
         buf.insert(buf.get_end_iter(), text)
@@ -401,6 +525,7 @@ class AppWindow(Gtk.Window):
 
 
 def run() -> None:
+    _load_css()
     win = AppWindow()
     win.show_all()
     Gtk.main()

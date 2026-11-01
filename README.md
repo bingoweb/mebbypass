@@ -2,7 +2,7 @@
 
 # 🛰️ mebbypass
 
-[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.6.0-blue)](#)
+[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.7.0-blue)](#)
 [![python](https://img.shields.io/badge/Python-3.9%2B-informational?logo=python&logoColor=white)](https://www.python.org)
 [![platform](https://img.shields.io/badge/platform-Pardus%20ETAP%2023%20%7C%20Debian%2012-green)](#)
 [![arayüz](https://img.shields.io/badge/aray%C3%BCz-GTK3-purple)](#)
@@ -54,7 +54,7 @@ testi** (boş SNI, DoT, QUIC, ECH, IPv6…).
 ## 📦 Kurulum (.deb)
 
 `bash
-sudo dpkg -i mebbypass_1.5.0-1_all.deb
+sudo dpkg -i mebbypass_1.7.0-1_all.deb
 sudo apt-get install -f   # eksik bağımlılık varsa tamamlar
 `
 
@@ -74,9 +74,11 @@ durdurulur ve sistem proxy ayarları **otomatik geri alınır**.
 mebbypass-gui
 `
 
-- **Başlat / Durdur** — tek düğmeyle kontrol
-- Durum etiketi, port ve parça boyu ayarı
-- **Canlı log görüntüleyici** (`~/.mebbypass/log.txt` kuyruğu)
+- **Modern başlık çubuğu** — Başlat / Durdur / Teşhis tek satırda
+- **Durum kartı** — büyük, renkli durum etiketi + gerçek port
+  (otomatik yedek port düşüşü anında görünür)
+- **Basit ayarlar** — port, parça boyu ve sistem-proxy anahtarı
+- **Canlı log** (`~/.mebbypass/log.txt` kuyruğu) + Temizle
 - **Teşhis Çalıştır** — rapor masaüstüne düşer
 - Pencere kapatılınca uygulama kapanmaz: **tepside (sistem tepsisi)**
   çalışmaya devam eder. Simgeye tıklayıp pencereyi geri açabilir,
