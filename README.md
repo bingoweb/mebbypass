@@ -2,7 +2,7 @@
 
 # 🛰️ mebbypass
 
-[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.8.0-blue)](#)
+[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-0.1.0-blue)](#)
 [![python](https://img.shields.io/badge/Python-3.9%2B-informational?logo=python&logoColor=white)](https://www.python.org)
 [![platform](https://img.shields.io/badge/platform-Pardus%20ETAP%2023%20%7C%20Debian%2012-green)](#)
 [![arayüz](https://img.shields.io/badge/aray%C3%BCz-GTK3-purple)](#)
@@ -54,7 +54,7 @@ testi** (boş SNI, DoT, QUIC, ECH, IPv6…).
 ## 📦 Kurulum (.deb)
 
 `bash
-sudo dpkg -i mebbypass_1.8.0-1_all.deb
+sudo dpkg -i mebbypass_0.1.0-1_all.deb
 sudo apt-get install -f   # eksik bağımlılık varsa tamamlar
 `
 
