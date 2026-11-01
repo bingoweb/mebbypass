@@ -417,6 +417,99 @@ def pick_sni(host: str, ips: list, chunk: int) -> str:
     return host
 
 
+def cert_safe_sni(ip: str, alt: str, host: str, chunk: int) -> bool:
+    """SNI=alt ile TAM TLS el sıkışması kurar; sunucu sertifikasının
+    SAN listesinin host'u kapsayı kapsamadığını döndürür.
+
+    SNI yeniden yazma yalnızca sertifika uyumluysa yapılır — aksi halde
+    tarayıcı sertifika hatası görürdüğü için ham SNI korunur. Modern
+    Google/Meta altyapıları mülkiyet-bazlı sertifika sunduğundan
+    çapraz kamufle her çift için uyumlu değildir (ör. SNI=www.youtube.com
+    sertifikası *.google.com'u kapsar; tersi kapsamaz).
+    """
+    try:
+        ctx = ssl.create_default_context()
+        raw = socket.create_connection((ip, 443), timeout=BLOCK_PROBE_TIMEOUT)
+        tls = ctx.wrap_socket(raw, server_hostname=alt)
+        try:
+            sans = [v for t, v in (tls.getpeercert().get("subjectAltName")
+                                   or []) if t == "DNS"]
+        finally:
+            tls.close()
+        host_l = host.lower().rstrip(".")
+        for s in sans:
+            s = s.lower().rstrip(".")
+            if s == host_l:
+                return True
+            if s.startswith("*."):
+                base = s[2:]
+                if (host_l.endswith("." + base)
+                        and "." not in host_l[: -(len(base) + 1)]):
+                    return True
+        return False
+    except (OSError, ssl.SSLError, ValueError):
+        return False
+
+
+def _rewrite_client_hello_sni(hello: bytes, new_sni: str):
+    """Tarayıcının ClientHello'sundaki SNI uzantısını new_sni ile
+    değiştirir; uzunluk alanlarını (uzantı, handshake, kayıt) yeniden
+    hesaplar. İlk TLS kaydında tek handshake mesajı yoksa None döndürür
+    (değişiklik yok, ham veri tünellemeye devam eder).
+    """
+    try:
+        if len(hello) < 5 or hello[0] != 0x16:
+            return None
+        rec_len = int.from_bytes(hello[3:5], "big")
+        if len(hello) < 5 + rec_len:
+            return None
+        hs = hello[5:5 + rec_len]
+        if hs[0] != 0x01:
+            return None
+        hs_len = int.from_bytes(hs[1:4], "big")
+        if hs_len + 4 != len(hs):
+            return None
+        body = hs[4:]
+        pos = 2 + 32                       # version + random
+        sid_len = body[pos]
+        pos += 1 + sid_len                 # session id
+        cs_len = int.from_bytes(body[pos:pos + 2], "big")
+        pos += 2 + cs_len                  # cipher suites
+        comp_len = body[pos]
+        pos += 1 + comp_len                # compression methods
+        exts_pos = pos
+        exts_len = int.from_bytes(body[pos:pos + 2], "big")
+        pos += 2
+        exts = body[pos:pos + exts_len]
+        if pos + exts_len != len(body):
+            return None
+        new_exts = b""
+        q = 0
+        sni_found = False
+        name = new_sni.encode("ascii", "ignore")
+        while q + 4 <= len(exts):
+            etype = int.from_bytes(exts[q:q + 2], "big")
+            elen = int.from_bytes(exts[q + 2:q + 4], "big")
+            data = exts[q + 4:q + 4 + elen]
+            q += 4 + elen
+            if etype == 0x0000 and not sni_found:
+                new_data = (struct.pack(">H", len(name) + 3) + b"\x00"
+                            + struct.pack(">H", len(name)) + name)
+                new_exts += struct.pack(">HH", etype, len(new_data)) + new_data
+                sni_found = True
+            else:
+                new_exts += struct.pack(">HH", etype, elen) + data
+        if not sni_found:
+            return None
+        new_body = (body[:exts_pos] + struct.pack(">H", len(new_exts))
+                    + new_exts)
+        new_hs = b"\x01" + struct.pack(">I", len(new_body))[1:] + new_body
+        new_rec = b"\x16\x03\x01" + struct.pack(">H", len(new_hs)) + new_hs
+        return new_rec + hello[5 + rec_len:]
+    except Exception:
+        return None
+
+
 # ------------------------------------------------------------ proxy çekirdeği
 
 def pump(src: socket.socket, dst: socket.socket,
@@ -501,18 +594,57 @@ def handle_connect(client: socket.socket, target: str, chunk: int) -> None:
     log(f"CONNECT {host}:{port} -> ip {ip} (SNI {sni})")
     upstream.settimeout(None)
 
-    client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    try:
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
-    t1 = threading.Thread(target=pump, args=(client, upstream, True, chunk),
-                          daemon=True)
-    t2 = threading.Thread(target=pump, args=(upstream, client, False, chunk),
-                          daemon=True)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-    client.close()
-    upstream.close()
+        # İlk uçuşu oku (tarayıcının ClientHello'su): SNI kamuflesi
+        # gerekiyorsa hello'daki SNI, sertifika uyumluysa izinli bir
+        # domain ile yeniden yazılır ve DPI'ya kamufle SNI görünür.
+        first_flight = b""
+        try:
+            client.settimeout(5.0)
+            while True:
+                part = client.recv(BUF_SIZE)
+                if not part:
+                    break
+                first_flight += part
+                if (len(first_flight) >= 5 and first_flight[0] == 0x16
+                        and len(first_flight)
+                        >= 5 + int.from_bytes(first_flight[3:5], "big")):
+                    break  # tek TLS kaydı tamam
+        except OSError:
+            pass
+        finally:
+            client.settimeout(None)
+
+        sent_first = False
+        if (sni != host and first_flight[:1] == b"\x16"
+                and cert_safe_sni(ip, sni, host, chunk)):
+            rewritten = _rewrite_client_hello_sni(first_flight, sni)
+            if rewritten is not None:
+                _send_fragmented(upstream, rewritten, chunk)
+                sent_first = True
+                log(f"SNI yeniden yazıldı: {host} -> {sni} (sertifika "
+                    f"uyumlu, DPI'ya kamufle SNI gidiyor)")
+        if first_flight and not sent_first:
+            _send_fragmented(upstream, first_flight, chunk)
+            sent_first = True
+
+        t1 = threading.Thread(target=pump,
+                              args=(client, upstream, not sent_first, chunk),
+                              daemon=True)
+        t2 = threading.Thread(target=pump,
+                              args=(upstream, client, False, chunk),
+                              daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    except OSError:
+        pass
+    finally:
+        client.close()
+        upstream.close()
 
 
 def handle_plain_http(client: socket.socket, first: bytes, chunk: int) -> None:
@@ -563,19 +695,25 @@ def handle_plain_http(client: socket.socket, first: bytes, chunk: int) -> None:
         client.close()
         return
     upstream.settimeout(None)
-    _send_fragmented(upstream, rewritten, chunk)
-    log(f"HTTP {method} {host}{path} (ip {ip})")
+    try:
+        _send_fragmented(upstream, rewritten, chunk)
+        log(f"HTTP {method} {host}{path} (ip {ip})")
 
-    t1 = threading.Thread(target=pump, args=(client, upstream, False, chunk),
-                          daemon=True)
-    t2 = threading.Thread(target=pump, args=(upstream, client, False, chunk),
-                          daemon=True)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-    client.close()
-    upstream.close()
+        t1 = threading.Thread(target=pump,
+                              args=(client, upstream, False, chunk),
+                              daemon=True)
+        t2 = threading.Thread(target=pump,
+                              args=(upstream, client, False, chunk),
+                              daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    except OSError:
+        pass
+    finally:
+        client.close()
+        upstream.close()
 
 
 def handle_client(client: socket.socket, chunk: int) -> None:
@@ -788,6 +926,9 @@ class Server:
                 continue
             except OSError:
                 break
+            # accept() edilen soket dinleyicinin zaman aşımını devralabilir
+            # (sürüm/platform farkı): işleyiciler engelleyici modda olmalı.
+            client.settimeout(None)
             threading.Thread(target=handle_client,
                              args=(client, self.chunk), daemon=True).start()
 
@@ -799,7 +940,10 @@ class Server:
         except OSError:
             pass
         try:
-            os.remove(os.path.join(os.path.dirname(LOG_FILE), "port"))
+            pf = os.path.join(os.path.dirname(LOG_FILE), "port")
+            with open(pf, encoding="utf-8") as f:
+                if f.read().strip() == str(self.port):
+                    os.remove(pf)  # başka örneğinkine dokunma
         except OSError:
             pass
         t = self._thread

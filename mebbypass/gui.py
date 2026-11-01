@@ -15,7 +15,6 @@ proxy ayarı geri alınır (mebbypass-dur.sh stop ile aynı davranış).
 Kullanım:  python3 -m mebbypass --gui   (ya da mebbypass-gui komutu)
 """
 
-import os
 import threading
 
 import gi
@@ -142,7 +141,10 @@ class AppWindow(Gtk.Window):
         try:
             gi.require_version("XApp", "1.0")
             from gi.repository import XApp
-            tray = XApp.StatusIcon()
+            try:
+                tray = XApp.StatusIcon.new()
+            except Exception:
+                tray = XApp.StatusIcon()
             self._set_tray_icon(tray)
             self._tray_kind = "xapp"
             tray.set_tooltip_text("mebbypass — durduruldu (tık: menü)")
@@ -178,11 +180,14 @@ class AppWindow(Gtk.Window):
                 return
             except Exception:
                 pass
-        pb = _make_icon_pixbuf()
-        if hasattr(tray, "set_icon_pixbuf"):
-            tray.set_icon_pixbuf(pb)
-        else:
-            tray.set_from_pixbuf(pb)
+        try:
+            pb = _make_icon_pixbuf()
+            if hasattr(tray, "set_icon_pixbuf"):
+                tray.set_icon_pixbuf(pb)
+            else:
+                tray.set_from_pixbuf(pb)
+        except Exception:
+            pass
 
     def _build_tray_menu(self) -> Gtk.Menu:
         menu = Gtk.Menu()

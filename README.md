@@ -2,7 +2,7 @@
 
 # 🛰️ mebbypass
 
-[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.5.0-blue)](#)
+[![sürüm](https://img.shields.io/badge/s%C3%BCr%C3%BCm-1.6.0-blue)](#)
 [![python](https://img.shields.io/badge/Python-3.9%2B-informational?logo=python&logoColor=white)](https://www.python.org)
 [![platform](https://img.shields.io/badge/platform-Pardus%20ETAP%2023%20%7C%20Debian%2012-green)](#)
 [![arayüz](https://img.shields.io/badge/aray%C3%BCz-GTK3-purple)](#)
@@ -144,10 +144,14 @@ rapordan doğrudan görülür ve her sonuç otomatik öneriyle gelir.
    başarısızsa sistem DNS'ine düşer; uygulama çalışmaya devam eder.
 2. **SNI kamufle** — MEB ağı TLS başlığındaki domain adını okuyup
    engeller. Bu proxy bağlantıyı hedefin **gerçek IP'sine** kurar;
-   ClientHello'daki SNI ise MEB'de izinli bir domain olarak gönderilir.
-   CDN'ler SNI'si uymayan TLS'yi kabul eder; sunucunun **gerçek
-   sertifikası** döner ve tarayıcı onu normal doğrular. Hangi SNI'nin
-   geçtiği otomatik keşfedilir (`--test`).
+   tarayıcının ClientHello'daki SNI, **sunucu sertifikasının SAN'ları
+   hedefi kapsıyorsa** MEB'de izinli bir domain ile **yeniden yazılır**
+   (uyumluluk otomatik sınanır; modern altyapılar mülkiyet-bazlı
+   sertifika sunduğundan her çift uyumlu değildir) — böylece DPI'ya
+   kamufle SNI gider, tarayıcı ise sunucunun gerçek sertifikasını
+   normal biçimde doğrular. SAN uyumsuzsa ham SNI korunur ve
+   parçalama devameder. Hangi SNI'nin geçtiği otomatik keşfedilir
+   (`--test`).
 3. **ClientHello parçalama** — DPI cihazlarını şaşırtmak için ilk TLS
    kaydı küçük segmentlere bölünür (varsayılan 8 bayt; `--chunk 0`
    ile kapatılır).
