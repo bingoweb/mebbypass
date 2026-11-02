@@ -412,7 +412,7 @@ def run_diagnosis(progress=None) -> str:
             else:
                 record("SNI havuzu", sni, False,
                        "ip %s — el sıkışma başarısız (SNI filtreleniyor "
-                       "olabilir)" % ips[0], time.time() - t1 + t0)
+                       "olabilir)" % ips[0], time.time() - t0)
                 sni_fail.append(sni)
 
     # Kamufle keşfi: hedef siteler için hangi SNI'nin işe yaradığı.
@@ -550,7 +550,9 @@ def run_diagnosis(progress=None) -> str:
 
     # ---- 5) Proxy uçtan uca
     notify("Proxy uçtan uca test ediliyor…")
-    server = Server(port=0, chunk=8)
+    # guard=False: çalışan proxy'nin kilit/port dosyasına dokunmadan
+    # geçici bir dinleyici aç (teşhis gerçek portu ezmemeli).
+    server = Server(port=0, chunk=8, guard=False)
     try:
         server.start()
     except OSError as e:
@@ -592,6 +594,11 @@ def run_diagnosis(progress=None) -> str:
     record("Sistem", "Çalışan mebbypass süreci", running_pid is not None,
            ("PID %s çalışıyor" % running_pid) if running_pid
            else "çalışmıyor (bu normal olabilir)", uyari=False)
+    st = core.stats()
+    record("Sistem", "Bu oturumdaki sayaçlar", True,
+           "DoH başarılı %d / başarısız %d · SNI kamufle %d · "
+           "SNI bulunamadı %d" % (st["doh_ok"], st["doh_fail"],
+                                  st["kamufle"], st["basarisiz"]))
 
     # ---- 7) Raporu yaz
     notify("Rapor masaüstüne yazılıyor…")

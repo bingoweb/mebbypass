@@ -2,8 +2,23 @@
 set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
-    pkill -f "python3 .* -m mebbypass" 2>/dev/null || true
+    pkill -f "python3 -X utf8 -m mebbypass" 2>/dev/null || true
+
+    # Otomatik başlatma birimleri paketle birlikte kaldırılmalı; aksi hâlde
+    # paket silindikten sonra her açılışta var olmayan bir komut çalışır.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable --now mebbypass.service >/dev/null 2>&1 || true
+    fi
+    rm -f "$HOME/.config/systemd/user/mebbypass.service" 2>/dev/null || true
+    rm -f "$HOME/.config/autostart/mebbypass-autostart.desktop" 2>/dev/null || true
+
+    # Kalıntı durum dosyaları (kilit dosyası yeni kurulumu engellemesin).
+    rm -f "$HOME/.mebbypass/mebbypass.lock" 2>/dev/null || true
+    rm -f "$HOME/.mebbypass/mebbypass.pid" 2>/dev/null || true
+
     if command -v python3 >/dev/null 2>&1; then
         python3 -X utf8 -m mebbypass --geri-al >/dev/null 2>&1 || true
     fi
 fi
+
+exit 0

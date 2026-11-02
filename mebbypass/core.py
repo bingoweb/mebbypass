@@ -23,6 +23,7 @@ Katmanlar:
 
 import json
 import os
+import shutil
 import socket
 import ssl
 import struct
@@ -38,10 +39,26 @@ PORT_CANDIDATES = [8080, 8081, 8888, 9090, 3128, 8443, 1080]
 BUF_SIZE = 65536
 CONNECT_TIMEOUT = 10.0
 BLOCK_PROBE_TIMEOUT = 6.0
-DOH_TIMEOUT = 8.0
+# SNI keşfi için toplam süre bütçesi: tek bir host yüzünden tarayıcının
+# zaman aşımına düşmemesi için tüm denemeler bu süreye sığdırılır.
+PROBE_BUDGET = 8.0
+SNI_CACHE_TTL = 600.0
+SNI_FAIL_TTL = 120.0
+CERT_CACHE_TTL = 900.0
+DOH_TIMEOUT = 6.0
+DOH_BUDGET = 12.0
+DOH_CHUNK = 8          # DoH ClientHello parça boyu (0 = kapalı)
 DNS_TTL_MIN = 30
 DNS_TTL_MAX = 300
-LOG_FILE = os.path.join(os.path.expanduser("~"), ".mebbypass", "log.txt")
+DNS_NEG_TTL = 30.0
+CLIENT_FIRST_TIMEOUT = 30.0
+TUNNEL_IDLE_TIMEOUT = 600.0
+LOG_MAX_BYTES = 2 * 1024 * 1024
+STATE_DIR = os.path.join(os.path.expanduser("~"), ".mebbypass")
+LOG_FILE = os.path.join(STATE_DIR, "log.txt")
+PID_FILE = os.path.join(STATE_DIR, "mebbypass.pid")
+LOCK_FILE = os.path.join(STATE_DIR, "mebbypass.lock")
+GS_BACKUP = os.path.join(STATE_DIR, "gsettings-yedek.json")
 
 # MEB/f@tih ağında genelde izinli domain'ler (SNI kamufle havuzu).
 # Önce en "nötr" olanlar: video/sosyal içerik sunan, MEB'de açık olanlar.
@@ -87,12 +104,17 @@ BLOCK_SIGNATURES = tuple(
 )
 
 _state = {
-    "mode": "doğrudan",
-    "camoufles": {},
-    "do_h": 0,
-    "failures": 0,
+    "camoufles": {},    # host -> (sni, son kullanma zamanı)
+    "sertifika": {},    # (host, alt_sni) -> (uygun mu, son kullanma)
 }
 _state_lock = threading.Lock()
+_stats = {"doh_ok": 0, "doh_fail": 0, "kamufle": 0, "basarisiz": 0}
+
+
+def stats() -> dict:
+    """Çalışma sayaçlarının anlık kopyası (teşhis raporu kullanır)."""
+    with _state_lock:
+        return dict(_stats)
 
 
 def log(msg: str) -> None:
@@ -100,7 +122,13 @@ def log(msg: str) -> None:
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     try:
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        try:
+            # Log dosyası sınırsız büyümesin: 2 MB'ı geçince döndür.
+            if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+        except OSError:
+            pass
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
@@ -134,6 +162,71 @@ def _dechunk(data: bytes) -> bytes:
     return out
 
 
+class _TLSStream:
+    """MemoryBIO tabanlı TLS akışı — ClientHello'yu parçalayarak gönderir.
+
+    ssl.wrap_socket() el sıkışmayı tek parça gönderdiği için DPI, SNI'yi
+    bütün olarak görür. Bu sınıf handshake baytlarını _send_fragmented()
+    ile küçük segmentlere bölerek yollar (dpihop tekniğinin DoH'a
+    uygulanmış hâli). chunk <= 0 ise tek parça gönderim yapılır.
+    """
+
+    def __init__(self, sock: socket.socket, ctx, sni: str, chunk: int,
+                 timeout: float) -> None:
+        self.sock = sock
+        self.chunk = chunk
+        self._in = ssl.MemoryBIO()
+        self._out = ssl.MemoryBIO()
+        self._obj = ctx.wrap_bio(self._in, self._out, server_hostname=sni)
+        sock.settimeout(timeout)
+        self._flush()
+        while True:
+            try:
+                self._obj.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                self._flush()
+                data = sock.recv(BUF_SIZE)
+                if not data:
+                    raise OSError("TLS: el sıkışma sırasında bağlantı kapandı")
+                self._in.write(data)
+            except ssl.SSLWantWriteError:
+                self._flush()
+        self._flush()
+
+    def _flush(self) -> None:
+        data = self._out.read()
+        while data:
+            _send_fragmented(self.sock, data, self.chunk)
+            data = self._out.read()
+
+    def sendall(self, data: bytes) -> None:
+        self._obj.write(data)
+        self._flush()
+
+    def recv(self, size: int) -> bytes:
+        while True:
+            try:
+                return self._obj.read(size)
+            except ssl.SSLWantReadError:
+                data = self.sock.recv(BUF_SIZE)
+                if not data:
+                    return b""
+                self._in.write(data)
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                return b""
+
+    def close(self) -> None:
+        try:
+            self._obj.unwrap()
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class DoH:
     """Standart kitaplıklı DNS-over-HTTPS çözücü.
 
@@ -145,14 +238,16 @@ class DoH:
 
     def __init__(self) -> None:
         self._cache: dict = {}
+        self._neg: dict = {}
         self._lock = threading.Lock()
         self.provider_idx = 0
         self.ok_count = 0
 
     def _do_query(self, url: str, ip: str, sni: str, name: str,
-                  qtype: int = 1) -> list:
+                  qtype: int = 1,
+                  timeout: float = DOH_TIMEOUT) -> list:
         """DoH JSON GET: ad çözümle, qtype'a göre IP listesi döndür."""
-        data = self._do_answer(url, ip, sni, name, qtype)
+        data = self._do_answer(url, ip, sni, name, qtype, timeout)
         ips = [a.get("data") for a in (data.get("Answer") or [])
                if a.get("type") == qtype
                and (qtype != 1 or a.get("data", "").count(".") == 3)]
@@ -167,18 +262,24 @@ class DoH:
         Teşhis sistemi HTTPS (type 65) ve AAAA (28) kayıtlarını okumak
         için kullanır (ECH tespiti, IPv6 yolu).
         """
+        deadline = time.time() + DOH_BUDGET
         n = len(DOH_PROVIDERS)
         for attempt in range(n):
             idx = (self.provider_idx + attempt) % n
             url, ip, sni = DOH_PROVIDERS[idx]
+            remain = deadline - time.time()
+            if remain <= 0.5:
+                break
             try:
-                return self._do_answer(url, ip, sni, name, qtype)
+                return self._do_answer(url, ip, sni, name, qtype,
+                                       min(DOH_TIMEOUT, remain))
             except Exception:
                 continue
         return {}
 
     def _do_answer(self, url: str, ip: str, sni: str, name: str,
-                   qtype: int) -> dict:
+                   qtype: int, timeout: float = DOH_TIMEOUT,
+                   chunk: int = DOH_CHUNK) -> dict:
         """DoH JSON GET: ham cevabı döndür.
 
         TLS, SNI'yi MEB'de izinli domain olarak kurar (ctx.wrap_socket +
@@ -202,9 +303,10 @@ class DoH:
             "\r\n"
         ).encode("latin1")
         ctx = ssl.create_default_context()
-        raw = socket.create_connection((ip, 443), timeout=DOH_TIMEOUT)
+        raw = socket.create_connection((ip, 443), timeout=timeout)
         try:
-            s = ctx.wrap_socket(raw, server_hostname=sni)
+            # ClientHello parçalanarak gönderilir (DPI kararsızlığı).
+            s = _TLSStream(raw, ctx, sni, chunk, timeout)
         except (OSError, ssl.SSLError):
             # TLS el sıkışması başarısız: alttaki soketi de kapat.
             try:
@@ -216,8 +318,12 @@ class DoH:
             s.sendall(req)
             # HTTP/1.1 + Connection: close → gövde bitince bağlantı kapanır.
             chunks = []
+            deadline = time.time() + timeout
             while True:
-                part = s.recv(65536)
+                if time.time() > deadline:
+                    # Yavaş damlayan sunucu toplam süreyi uzatmasın.
+                    raise OSError("DoH yanıtı zaman aşımına uğradı")
+                part = s.recv(BUF_SIZE)
                 if not part:
                     break
                 chunks.append(part)
@@ -259,27 +365,38 @@ class DoH:
             hit = self._cache.get(name)
             if hit and hit[1] > now:
                 return hit[0]
+            neg = self._neg.get(name)
+            if neg and neg > now:
+                return []          # kısa süre önce çözülemedi: yeniden denemeyi geciktir
         ips = []
         last_err = None
+        deadline = now + DOH_BUDGET
         n = len(DOH_PROVIDERS)
         for attempt in range(n):
             idx = (self.provider_idx + attempt) % n
             url, ip, sni = DOH_PROVIDERS[idx]
+            remain = deadline - time.time()
+            if remain <= 0.5:
+                break
             try:
-                ips = self._do_query(url, ip, sni, name)
+                ips = self._do_query(url, ip, sni, name,
+                                     timeout=min(DOH_TIMEOUT, remain))
                 self.provider_idx = idx  # çalışan sağlayıcıda kal
                 break
             except Exception as e:
                 last_err = e
         if not ips:
-            with _state_lock:
-                _state["do_h_failures"] = _state.get("do_h_failures", 0) + 1
+            with self._lock:
+                self._neg[name] = now + DNS_NEG_TTL
+            _stats["doh_fail"] += 1
             log(f"DoH hatası ({name}): {last_err}")
             return []
         ttl = DNS_TTL_MAX
         with self._lock:
             self._cache[name] = (ips, now + ttl)
+            self._neg.pop(name, None)
             self.ok_count += 1
+        _stats["doh_ok"] += 1
         return ips
 
 
@@ -292,8 +409,6 @@ class Dns:
     def resolve(self, name: str) -> list:
         ips = self.doh.resolve(name)
         if ips:
-            with _state_lock:
-                _state["do_h"] += 1
             return ips
         # Yedek: sistem çözümleyicisi (okul filtresi burada devrede olabilir).
         try:
@@ -383,53 +498,76 @@ def try_handshake(ip: str, port: int, sni: str, chunk: int,
             pass
 
 
-def pick_sni(host: str, ips: list, chunk: int) -> str:
-    """Bu hedef için en iyi SNI'yi seç (önbellekli).
+def pick_sni(host: str, ips: list, chunk: int,
+             budget: float = PROBE_BUDGET) -> str:
+    """Bu hedef için en iyi SNI'yi seç (önbellekli + süre bütçeli).
 
     Önce gerçek SNI denenir (çoğu site zaten açıktır); geçmezse izinli
-    havuzundaki SNI'ler sırayla denenir.
+    havuzundaki SNI'ler sırayla denenir. Tüm denemeler budget saniyeye
+    sığdırılır: engelli bir IP'de tarayıcıyı dakikalarca bekletmemek için
+    süre dolduğunda gerçek SNI ile devam edilir. Sonuç — başarısızlık
+    dâhil — önbelleğe alınır ki her yeni bağlantıda yeniden denenmesin.
     """
+    now = time.time()
     with _state_lock:
-        cached = _state["camoufles"].get(host)
-    if cached:
-        return cached
+        hit = _state["camoufles"].get(host)
+    if hit and hit[1] > now:
+        return hit[0]
     if not ips:
         return host
     ip = ips[0]
-    port = 443
-    # 1) Doğrudan gerçek SNI.
-    if try_handshake(ip, port, host, chunk):
+    deadline = now + budget
+
+    def _cache(sni: str, ttl: float) -> None:
         with _state_lock:
-            _state["camoufles"][host] = host
+            _state["camoufles"][host] = (sni, time.time() + ttl)
+
+    def _probe(sni: str) -> bool:
+        remain = deadline - time.time()
+        if remain <= 0.4:
+            return False
+        return try_handshake(ip, 443, sni, chunk,
+                             timeout=min(remain, BLOCK_PROBE_TIMEOUT))
+
+    # 1) Doğrudan gerçek SNI.
+    if _probe(host):
+        _cache(host, SNI_CACHE_TTL)
         return host
     # 2) İzinli SNI havuzu (SNI ≠ Host; CDN yine de bağlanır).
     for alt in ALLOWED_SNIS:
         if alt == host:
             continue
-        if try_handshake(ip, port, alt, chunk):
+        if _probe(alt):
             log(f"SNI kamuflesi: {host} -> SNI {alt}")
-            with _state_lock:
-                _state["camoufles"][host] = alt
-                _state["mode"] = "kamufle"
+            _stats["kamufle"] += 1
+            _cache(alt, SNI_CACHE_TTL)
             return alt
-    with _state_lock:
-        _state["failures"] += 1
-    log(f"{host} için uygun SNI bulunamadı (tümü engelli mi?)")
+    _stats["basarisiz"] += 1
+    _cache(host, SNI_FAIL_TTL)
+    log(f"{host} için uygun SNI bulunamadı (bütçe {budget:.1f} sn doldu)")
     return host
 
 
-def cert_safe_sni(ip: str, alt: str, host: str, chunk: int) -> bool:
-    """SNI=alt ile TAM TLS el sıkışması kurar; sunucu sertifikasının
-    SAN listesinin host'u kapsayı kapsamadığını döndürür.
+def cert_safe_sni(ip: str, alt: str, host: str) -> bool:
+    """SNI=alt ile TLS kurup sunucunun sunduğu sertifikayı okur ve SAN
+    listesinin host'u kapsayıp kapsamadığını döndürür (önbellekli).
 
-    SNI yeniden yazma yalnızca sertifika uyumluysa yapılır — aksi halde
-    tarayıcı sertifika hatası görürdüğü için ham SNI korunur. Modern
-    Google/Meta altyapıları mülkiyet-bazlı sertifika sunduğundan
-    çapraz kamufle her çift için uyumlu değildir (ör. SNI=www.youtube.com
-    sertifikası *.google.com'u kapsar; tersi kapsamaz).
+    Zincir doğrulanır fakat HOSTNAME kontrolü yapılmaz: amaç, sunucunun bu
+    SNI için hangi sertifikayı sunduğunu görmek. Sunucu SNI'yi yok sayıp
+    kendi sertifikasını verse bile SAN host'u kapsıyorsa yeniden yazma
+    güvenlidir. Tarayıcı, yeniden yazılmış SNI ile aynı sertifikayı alıp
+    host'a göre normal doğrular; SAN uymuyorsa yeniden yazma yapılmaz.
     """
+    now = time.time()
+    key = (host, alt)
+    with _state_lock:
+        hit = _state["sertifika"].get(key)
+    if hit and hit[1] > now:
+        return hit[0]
+    ok = False
     try:
         ctx = ssl.create_default_context()
+        ctx.check_hostname = False   # host'a göre kontrol etmiyoruz
         raw = socket.create_connection((ip, 443), timeout=BLOCK_PROBE_TIMEOUT)
         tls = ctx.wrap_socket(raw, server_hostname=alt)
         try:
@@ -441,15 +579,19 @@ def cert_safe_sni(ip: str, alt: str, host: str, chunk: int) -> bool:
         for s in sans:
             s = s.lower().rstrip(".")
             if s == host_l:
-                return True
+                ok = True
+                break
             if s.startswith("*."):
                 base = s[2:]
                 if (host_l.endswith("." + base)
                         and "." not in host_l[: -(len(base) + 1)]):
-                    return True
-        return False
+                    ok = True
+                    break
     except (OSError, ssl.SSLError, ValueError):
-        return False
+        ok = False
+    with _state_lock:
+        _state["sertifika"][key] = (ok, now + CERT_CACHE_TTL)
+    return ok
 
 
 def _rewrite_client_hello_sni(hello: bytes, new_sni: str):
@@ -517,6 +659,11 @@ def pump(src: socket.socket, dst: socket.socket,
          fragment_first: bool, chunk: int) -> None:
     """Bir yönde veri aktar; istemci->sunucu ilk gönderimde parçala."""
     try:
+        # Boşta kalan tüneller süresiz thread tutmasın.
+        try:
+            src.settimeout(TUNNEL_IDLE_TIMEOUT)
+        except OSError:
+            pass
         first = True
         while True:
             data = src.recv(BUF_SIZE)
@@ -577,7 +724,6 @@ def handle_connect(client: socket.socket, target: str, chunk: int) -> None:
         client.close()
         return
 
-    sni = pick_sni(host, ips, chunk)
     upstream, ip = None, None
     for cand in ips:
         try:
@@ -592,11 +738,15 @@ def handle_connect(client: socket.socket, target: str, chunk: int) -> None:
         client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         client.close()
         return
-    log(f"CONNECT {host}:{port} -> ip {ip} (SNI {sni})")
+    log(f"CONNECT {host}:{port} -> ip {ip}")
     upstream.settimeout(None)
 
     try:
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+
+        # SNI keşfi, tarayıcıya 200 döndükten SONRA yapılır: engelli bir
+        # IP'de süre bütçesi dolsa bile tarayıcı boşuna beklemez.
+        sni = pick_sni(host, ips, chunk)
 
         # İlk uçuşu oku (tarayıcının ClientHello'su): SNI kamuflesi
         # gerekiyorsa hello'daki SNI, sertifika uyumluysa izinli bir
@@ -620,7 +770,7 @@ def handle_connect(client: socket.socket, target: str, chunk: int) -> None:
 
         sent_first = False
         if (sni != host and first_flight[:1] == b"\x16"
-                and cert_safe_sni(ip, sni, host, chunk)):
+                and cert_safe_sni(ip, sni, host)):
             rewritten = _rewrite_client_hello_sni(first_flight, sni)
             if rewritten is not None:
                 _send_fragmented(upstream, rewritten, chunk)
@@ -697,7 +847,8 @@ def handle_plain_http(client: socket.socket, first: bytes, chunk: int) -> None:
         return
     upstream.settimeout(None)
     try:
-        _send_fragmented(upstream, rewritten, chunk)
+        # Düz HTTP'de 8 baytlık parçalama anlamsız: yalnız TLS için.
+        _send_fragmented(upstream, rewritten, 0)
         log(f"HTTP {method} {host}{path} (ip {ip})")
 
         t1 = threading.Thread(target=pump,
@@ -719,6 +870,8 @@ def handle_plain_http(client: socket.socket, first: bytes, chunk: int) -> None:
 
 def handle_client(client: socket.socket, chunk: int) -> None:
     try:
+        # Sessiz bağlantı thread'i süresiz tutmasın.
+        client.settimeout(CLIENT_FIRST_TIMEOUT)
         first = client.recv(BUF_SIZE)
         if not first:
             client.close()
@@ -740,27 +893,108 @@ def handle_client(client: socket.socket, chunk: int) -> None:
 
 # ------------------------------------------------------------ sistem ayarları
 
-def set_firefox_proxy(port: int, on: bool) -> None:
-    """Cinnamon/Firefox gsettings proxy ayarını değiştirir (root gerekmez)."""
-    gset = ["gsettings", "set",
-            "org.gnome.system.proxy", "mode",
-            "manual" if on else "none"]
+_GS_PROXY = "org.gnome.system.proxy"
+_GS_KEYS = [
+    (_GS_PROXY, "mode"),
+    (_GS_PROXY, "autoconfig-url"),
+    (_GS_PROXY, "ignore-hosts"),
+    (_GS_PROXY, "use-same-proxy"),
+    (_GS_PROXY + ".http", "host"),
+    (_GS_PROXY + ".http", "port"),
+    (_GS_PROXY + ".https", "host"),
+    (_GS_PROXY + ".https", "port"),
+    (_GS_PROXY + ".ftp", "host"),
+    (_GS_PROXY + ".ftp", "port"),
+    (_GS_PROXY + ".socks", "host"),
+    (_GS_PROXY + ".socks", "port"),
+]
+# GNOME ignore-hosts anahtarı CIDR bekler; "127.*" biçimi yorumlanmaz ve
+# yerel adresler proxy'ye giderek kendi kendine döngü oluşturabilir.
+_IGNORE_HOSTS = "['localhost', '127.0.0.0/8', '::1', '169.254.0.0/16']"
+
+
+def _gs(*args: str, timeout: float = 8.0):
+    """gsettings çağrısı: (başarılı, çıktı) döndürür; istisna atmaz."""
     try:
-        subprocess.run(gset, check=True, capture_output=True, timeout=10)
-        if on:
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.http",
-                            "host", "127.0.0.1"], check=True, capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.http",
-                            "port", str(port)], check=True, capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy",
-                            "ignore-hosts",
-                            "localhost;127.*;169.254.*;::1"],
-                           check=True, capture_output=True)
-            log("Firefox/gsettings proxy: 127.0.0.1:%d (manuel)" % port)
+        r = subprocess.run(["gsettings", *args], capture_output=True,
+                           timeout=timeout, text=True)
+        if r.returncode != 0:
+            return False, (r.stderr or "").strip()
+        return True, (r.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
+def _gsettings_backup() -> None:
+    """İlk açılışta mevcut proxy ayarlarını bir kez yedekler.
+
+    Böylece mebbypass kapatılırken okulun/tahtanın önceden tanımlı proxy
+    veya PAC yapılandırması aynen geri yüklenir.
+    """
+    if os.path.exists(GS_BACKUP):
+        return
+    values = {}
+    for schema, key in _GS_KEYS:
+        ok, out = _gs("get", schema, key)
+        if ok:
+            values[f"{schema} {key}"] = out
+    if not values:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = GS_BACKUP + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(values, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, GS_BACKUP)
+        log("gsettings proxy ayarları yedeklendi: %s" % GS_BACKUP)
+    except OSError as e:
+        log("gsettings yedeği yazılamadı: %s" % e)
+
+
+def _gsettings_restore() -> bool:
+    """Yedeği geri yükler; yedek yoksa mode=none yapar."""
+    if not os.path.exists(GS_BACKUP):
+        _gs("set", _GS_PROXY, "mode", "none")
+        return False
+    try:
+        with open(GS_BACKUP, encoding="utf-8") as f:
+            values = json.load(f)
+    except (OSError, ValueError):
+        values = {}
+    for full, value in values.items():
+        schema, _, key = full.partition(" ")
+        if schema and key:
+            _gs("set", schema, key, value)
+    try:
+        os.remove(GS_BACKUP)
+    except OSError:
+        pass
+    return True
+
+
+def set_firefox_proxy(port: int, on: bool) -> None:
+    """Cinnamon/Firefox gsettings proxy ayarını değiştirir (root gerekmez).
+
+    Kapatırken ilk açılışta alınan yedek geri yüklenir; böylece okulun
+    önceden tanımlı proxy/PAC yapılandırması kaybolmaz.
+    """
+    if not shutil.which("gsettings"):
+        log("gsettings bulunamadı: tarayıcı proxy'sini elle ayarlayın")
+        return
+    if not on:
+        if _gsettings_restore():
+            log("Firefox/gsettings proxy: önceki ayarlara dönüldü")
         else:
             log("Firefox/gsettings proxy: kapatıldı")
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
-        log(f"gsettings ayarı yapılamadı (Firefox ayarlarını elle yapın): {e}")
+        return
+    _gsettings_backup()
+    _gs("set", _GS_PROXY, "mode", "manual")
+    for proto in ("http", "https", "ftp"):
+        _gs("set", f"{_GS_PROXY}.{proto}", "host", "127.0.0.1")
+        _gs("set", f"{_GS_PROXY}.{proto}", "port", str(port))
+    _gs("set", _GS_PROXY, "use-same-proxy", "false")
+    _gs("set", _GS_PROXY, "ignore-hosts", _IGNORE_HOSTS)
+    log("Firefox/gsettings proxy: 127.0.0.1:%d (http+https+ftp)" % port)
 
 
 def write_env_files(port: int, on: bool) -> None:
@@ -770,18 +1004,22 @@ def write_env_files(port: int, on: bool) -> None:
         f"export https_proxy=http://127.0.0.1:{port}",
         f"export HTTP_PROXY=http://127.0.0.1:{port}",
         f"export HTTPS_PROXY=http://127.0.0.1:{port}",
-        "export no_proxy=localhost,127.*,169.254.*,::1",
-        "export NO_PROXY=localhost,127.*,169.254.*,::1",
+        "export no_proxy=localhost,127.0.0.1,::1",
+        "export NO_PROXY=localhost,127.0.0.1,::1",
     ]
     marker_a, marker_b = "# >>> mebbypass", "# <<< mebbypass"
     home = os.path.expanduser("~")
     for fn in ("profile", "bashrc"):
         path = os.path.join(home, "." + fn)
-        if not os.path.exists(path):
+        exists = os.path.exists(path)
+        if not exists and not on:
             continue
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                content = f.read()
+            if exists:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            else:
+                content = ""
         except OSError:
             continue
         new = content
@@ -845,6 +1083,115 @@ def port_in_use(port: int) -> bool:
     finally:
         s.close()
 
+class AlreadyRunning(Exception):
+    """Başka bir mebbypass örneği zaten çalışıyor."""
+
+    def __init__(self, pid: int) -> None:
+        super().__init__("mebbypass zaten çalışıyor (PID %d)" % pid)
+        self.pid = pid
+
+
+def pid_alive(pid: int) -> bool:
+    """Sürecin yaşayıp yaşamadığını platformdan bağımsız sınar.
+
+    Windows'ta os.kill(pid, 0) süreci SONLANDIRIR; bu yüzden orada
+    OpenProcess kullanılır.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not h:
+            return False
+        ctypes.windll.kernel32.CloseHandle(h)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_pid_file() -> int:
+    """~/.mebbypass/mebbypass.pid içindeki pid (yoksa 0)."""
+    try:
+        with open(PID_FILE, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _read_lock_pid() -> int:
+    try:
+        with open(LOCK_FILE, encoding="utf-8") as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_pid_files() -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        for path in (PID_FILE, LOCK_FILE):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def _remove_own_pid_files() -> None:
+    """Yalnız kendi pid'ini taşıyan dosyaları siler."""
+    me = str(os.getpid())
+    _lock_owner["pid"] = 0
+    for path in (PID_FILE, LOCK_FILE):
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read().strip() != me:
+                    continue
+        except OSError:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+_lock_owner = {"pid": 0}
+
+
+def acquire_instance_lock() -> None:
+    """Tek örnek kilidi alır; başka örnek yaşıyorsa AlreadyRunning atar."""
+    # Aynı süreçte ikinci kez kilit istenmesi de reddedilir: aksi hâlde
+    # tek süreç içinde iki dinleyici açılabilirdi (GUI + arka plan).
+    if _lock_owner["pid"] == os.getpid():
+        raise AlreadyRunning(os.getpid())
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    except OSError as e:
+        raise OSError("durum dizini oluşturulamadı: %s" % e)
+    me = os.getpid()
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        other = _read_lock_pid()
+        if other and other != me and pid_alive(other):
+            raise AlreadyRunning(other)
+        try:                      # bayat kilit: devral
+            os.remove(LOCK_FILE)
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                         0o644)
+        except OSError as e:
+            raise OSError("kilit dosyası oluşturulamadı: %s" % e)
+    except OSError as e:
+        raise OSError("kilit dosyası oluşturulamadı: %s" % e)
+    try:
+        os.write(fd, str(me).encode())
+        _lock_owner["pid"] = me
+    finally:
+        os.close(fd)
+
+
 class Server:
     """Dinleyiciyi arka planda yöneten sarmalayıcı (GUI ve CLI ortak kullanır).
 
@@ -854,15 +1201,20 @@ class Server:
     """
 
     def __init__(self, port: int = DEFAULT_PORT, chunk: int = 8,
-                 auto: bool = False) -> None:
+                 auto: bool = False, guard: bool = True) -> None:
         """auto=True ise tercih edilen port doluysa PORT_CANDIDATES
         adayları sırayla denenir; son çare çekirdek boş bir port seçer
         (port=0). Pardus ETAP akıllı tahtalarda 8080 diğer okul
         yazılımları tarafından kullanılabildiği için gereklidir.
+
+        guard=True ise tek örnek kilidi alınır: aynı anda ikinci bir
+        mebbypass başlatılamaz (AlreadyRunning). Teşhis gibi geçici
+        sunucular guard=False kullanır.
         """
         self.port = port
         self.auto = auto
         self.chunk = chunk
+        self.guard = guard
         self._sock = None
         self._running = False
         self._thread = None
@@ -874,6 +1226,10 @@ class Server:
     def start(self) -> "Server":
         if self._running:
             return self
+        locked = False
+        if self.guard:
+            acquire_instance_lock()
+            locked = True
         ports = [self.port]
         if self.auto:
             ports += [c for c in PORT_CANDIDATES if c != self.port]
@@ -898,11 +1254,24 @@ class Server:
             self.port = p
             break
         if s is None:
+            if locked:
+                _remove_own_pid_files()
             raise OSError(f"Tüm port adayları dolu: {ports} ({err})")
-        s.listen(64)
+        try:
+            s.listen(64)
+        except OSError:
+            try:
+                s.close()
+            except OSError:
+                pass
+            if locked:
+                _remove_own_pid_files()
+            raise
         s.settimeout(0.5)
         self._sock = s
         self._running = True
+        if locked:
+            _write_pid_files()
         self._write_port_file()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -910,11 +1279,17 @@ class Server:
 
     def _write_port_file(self) -> None:
         """Gerçek dinleme portunu ~/.mebbypass/port dosyasına yazar;
-        mebbypass-dur ve teşhis sistemi okur."""
+        mebbypass-dur ve teşhis sistemi okur.
+
+        guard=False (teşhis gibi geçici sunucular) bu dosyayı yazmaz:
+        çalışan gerçek proxy'nin portu yanlışlıkla ezilmemeli.
+        """
+        if not self.guard:
+            return
         try:
-            d = os.path.dirname(LOG_FILE)
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "port"), "w", encoding="utf-8") as f:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(os.path.join(STATE_DIR, "port"), "w",
+                      encoding="utf-8") as f:
                 f.write(str(self.port))
         except OSError:
             pass
@@ -926,6 +1301,7 @@ class Server:
             except socket.timeout:
                 continue
             except OSError:
+                self._running = False
                 break
             # accept() edilen soket dinleyicinin zaman aşımını devralabilir
             # (sürüm/platform farkı): işleyiciler engelleyici modda olmalı.
@@ -941,12 +1317,16 @@ class Server:
         except OSError:
             pass
         try:
-            pf = os.path.join(os.path.dirname(LOG_FILE), "port")
+            pf = os.path.join(STATE_DIR, "port")
             with open(pf, encoding="utf-8") as f:
                 if f.read().strip() == str(self.port):
                     os.remove(pf)  # başka örneğinkine dokunma
         except OSError:
             pass
+        if self.guard:
+            # Teşhis gibi geçici sunucular gerçek proxy'nin kilit/pid
+            # dosyalarına dokunmamalı (aynı süreçte çalışabilirler).
+            _remove_own_pid_files()
         t = self._thread
         if t is not None and t.is_alive():
             t.join(timeout=2.0)
@@ -956,29 +1336,56 @@ class Server:
 
 # ------------------------------------------------------- arka plan süreci
 
-def spawn_background(port: int) -> int:
+def spawn_background(port: int, chunk: int = 8, sistem: bool = True) -> int:
     """Proxy'yi GUI'den bağımsız bir arka plan süreci olarak başlatır
     ve yeni sürecin pid'ini döndürür.
 
     GUI kapatılırken proxy'nin çalışmaya devam edebilmesi için kullanılır:
     çağıran taraf önce kendi sunucusunu durdurur (ayarı geri almadan),
     sonra bu fonksiyonla aynı portu arka planda yeniden başlatır.
+    Kullanıcının seçtiği parça boyu ve sistem-proxy tercihi korunur.
     Sürecin pid'i ~/.mebbypass/mebbypass.pid'e yazılır (dur.sh ile uyumlu).
+    Süreç ayağa kalkmazsa OSError yükseltilir; böylece GUI kullanıcıya
+    "proxy arka planda çalışıyor" diye yanlış bilgi vermez.
     """
     args = [sys.executable, "-X", "utf8", "-m", "mebbypass",
-            "--sistem", "-p", str(port)]
+            "-p", str(port), "--chunk", str(chunk)]
+    if sistem:
+        args.append("--sistem")
+    kw = {}
+    if os.name == "nt":
+        # Windows'ta GUI kapanınca çocuk süreç ölmesin.
+        kw["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    else:
+        kw["start_new_session"] = True
     proc = subprocess.Popen(
         args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True)
+        stderr=subprocess.DEVNULL, **kw)
     try:
-        d = os.path.dirname(LOG_FILE)
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "mebbypass.pid"), "w",
-                  encoding="utf-8") as f:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(PID_FILE, "w", encoding="utf-8") as f:
             f.write(str(proc.pid))
     except OSError:
         pass
-    return proc.pid
+    # Ayağa kalktığını doğrula: port dosyası istenen portu göstermeli.
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            with open(os.path.join(STATE_DIR, "port"), encoding="utf-8") as f:
+                if f.read().strip() == str(port):
+                    return proc.pid
+        except OSError:
+            pass
+        time.sleep(0.1)
+    if proc.poll() is not None:
+        raise OSError("arka plan süreci başlatılamadı (çıkış kodu %s); "
+                      "log: %s" % (proc.returncode, LOG_FILE))
+    raise OSError("arka plan süreci %d saniyede %d portunu açamadı; "
+                  "log: %s" % (6, port, LOG_FILE))
 
 
 # ---------------------------------------------------------------- testler

@@ -18,13 +18,15 @@ Kullanım:  python3 -m mebbypass --gui   (ya da mebbypass-gui komutu)
 import os
 import shutil
 import subprocess
+import sys
 import threading
 
 import gi
 gi.require_version("Gtk", "3.0")  # noqa: E402 (Cinnamon'un GTK3'ü)
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
-from .core import DEFAULT_PORT, LOG_FILE, Server, set_system, spawn_background
+from .core import (DEFAULT_PORT, LOG_FILE, AlreadyRunning, Server, log,
+                   pid_alive, set_system, spawn_background)
 
 _CSS = b"""
 .mbp-card {
@@ -199,6 +201,7 @@ class AppWindow(Gtk.Window):
         log_head.pack_start(log_title, False, False, 0)
         log_hint = Gtk.Label(label="Pencere kapatınca tepside sürer")
         log_hint.get_style_context().add_class("dim-label")
+        self.log_hint = log_hint
         log_head.pack_start(log_hint, False, False, 0)
         logcard.pack_start(log_head, False, False, 0)
         self.log_view = Gtk.TextView()
@@ -256,6 +259,9 @@ class AppWindow(Gtk.Window):
             except Exception:
                 tray = None
         self.tray = tray
+        if tray is None:
+            # Tepsi yoksa gizlenen pencereye geri dönüş yolu olmaz.
+            self.log_hint.set_text("Tepsi simgesi yok — kapatınca çıkış sorulur")
 
     def _set_tray_icon(self, tray) -> None:
         """Tema ikonunu kullan; yoksa basit pixbuf simgesi çiz."""
@@ -318,11 +324,14 @@ class AppWindow(Gtk.Window):
             self.present()
 
     def _hint_tray_once(self) -> None:
+        if self.tray is None:
+            return
         if self._hidden_hinted:
             return
         self._hidden_hinted = True
         self._append("[gui] pencere gizlendi; mebbypass tepside çalışmaya "
-                     "devam ediyor. Tam çıkış: tepsi menüsü > Çıkış.\n")
+                     "devam ediyor. Geri açmak: tepsi simgesine tıklayın. "
+                     "Tam çıkış: tepsi menüsü > Çıkış.\n")
 
     def _sync_menu(self) -> None:
         running = self.server is not None
@@ -399,14 +408,27 @@ class AppWindow(Gtk.Window):
                          args=(port, chunk, sistem), daemon=True).start()
 
     def _worker_start(self, port: int, chunk: int, sistem: bool) -> None:
+        srv = None
         try:
             # Otomatik yedek port: seçilen port doluysa adaylar denenir.
             srv = Server(port=port, chunk=chunk, auto=True)
             srv.start()
+        except AlreadyRunning as e:
+            GLib.idle_add(
+                self._show_error,
+                "mebbypass zaten çalışıyor (PID %d).\n\n"
+                "Mevcut proxy'yi durdurmak için:\n"
+                "  mebbypass-dur.sh stop\n"
+                "Ardından buradan yeniden başlatabilirsiniz." % e.pid)
+            GLib.idle_add(self._after_start_error)
+            return
         except OSError as e:
             GLib.idle_add(self._show_error,
                           "Başlatılamadı: %s\n\nTüm aday portlar dolu "
                           "görünüyor." % e)
+            GLib.idle_add(self._after_start_error)
+            return
+        if srv is None:      # kuramsal olarak erişilemez
             GLib.idle_add(self._after_start_error)
             return
         if sistem:
@@ -455,11 +477,21 @@ class AppWindow(Gtk.Window):
         threading.Thread(target=self._worker_tani, daemon=True).start()
 
     def _worker_tani(self) -> None:
-        from .diagnosis import run_diagnosis
-        path = run_diagnosis(
-            progress=lambda s: GLib.idle_add(self._append,
-                                             "[teşhis] %s\n" % s))
+        try:
+            from .diagnosis import run_diagnosis
+            path = run_diagnosis(
+                progress=lambda s: GLib.idle_add(self._append,
+                                                 "[teşhis] %s\n" % s))
+        except Exception as e:      # teşhis çökse de arayüz kilitlenmesin
+            GLib.idle_add(self._show_error,
+                          "Teşhis çalıştırılamadı: %s" % e)
+            GLib.idle_add(self._after_tani_error)
+            return
         GLib.idle_add(self._after_tani, path)
+
+    def _after_tani_error(self) -> bool:
+        self.btn_tani.set_sensitive(True)
+        return False
 
     def _after_tani(self, path: str) -> bool:
         self.btn_tani.set_sensitive(True)
@@ -476,7 +508,15 @@ class AppWindow(Gtk.Window):
         return False
 
     def on_delete_event(self, _w, _e) -> bool:
-        """Pencere kapatma düğmesi: gizle; uygulama tepside sürer."""
+        """Pencere kapatma düğmesi: gizle; uygulama tepside sürer.
+
+        Tepsi simgesi kurulamadıysa gizlemek pencereyi erişilemez kılar
+        (geri açacak bir yol kalmaz); bu durumda normal çıkış akışı
+        çalıştırılır.
+        """
+        if self.tray is None:
+            self.on_quit()
+            return False
         self.hide()
         self._hint_tray_once()
         return True  # pencere yok edilmez
@@ -501,12 +541,32 @@ class AppWindow(Gtk.Window):
             response = dlg.run()
             dlg.destroy()
             port = srv.port
-            self.server = None
+            chunk = int(self.chunk.get_value())
+            sistem = self.sw_system.get_active()
             if response == 1:
                 # Ayarları bozmadan bırak; bağımsız süreç olarak sürdür.
                 srv.stop()
-                spawn_background(port)
+                self.server = None
+                try:
+                    pid = spawn_background(port, chunk=chunk, sistem=sistem)
+                    log("Proxy arka planda sürüyor (PID %d, port %d)"
+                        % (pid, port))
+                except OSError as e:
+                    # Arka plan açılamadı: proxy'yi bu pencerede sürdür.
+                    try:
+                        again = Server(port=port, chunk=chunk, auto=True)
+                        again.start()
+                        self.server = again
+                        self._after_start(again.port, sistem, again.port != port)
+                    except Exception:
+                        self._after_stop("Durduruldu — arka planda "
+                                         "başlatılamadı")
+                    self._show_error(
+                        "Proxy arka planda başlatılamadı:\n%s\n\n"
+                        "Ayrıntı için log dosyasına bakın." % e)
+                    return  # çıkma, pencere açık kalsın
             elif response == 2:
+                self.server = None
                 try:
                     set_system(port, on=False)
                 except Exception:
@@ -545,7 +605,11 @@ class AppWindow(Gtk.Window):
                             "[Unit]\nDescription=mebbypass proxy\n"
                             "After=network-online.target\n\n"
                             "[Service]\nExecStart=%s --sistem\n"
-                            "Restart=on-failure\n\n"
+                            "Restart=on-failure\n"
+                            "RestartSec=5\n"
+                            # 3 = "zaten çalışıyor": yeniden başlatma döngüsü
+                            # oluşmasın (kullanıcı elle başlatmış olabilir).
+                            "RestartPreventExitStatus=3\n\n"
                             "[Install]\nWantedBy=default.target\n" % exe)
                     subprocess.run(
                         ["systemctl", "--user", "daemon-reload"],
@@ -598,6 +662,10 @@ class AppWindow(Gtk.Window):
     def _poll_log(self) -> bool:
         try:
             with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() < self._log_offset:
+                    # Log döndürüldü (2 MB sınırı): baştan oku.
+                    self._log_offset = 0
                 f.seek(self._log_offset)
                 data = f.read()
                 self._log_offset = f.tell()
@@ -635,8 +703,53 @@ class AppWindow(Gtk.Window):
         return False
 
 
+def _gui_lock_path() -> str:
+    return os.path.join(os.path.expanduser("~"), ".mebbypass", "gui.pid")
+
+
+def _acquire_gui_lock() -> bool:
+    """Aynı anda iki arayüz açılmasını engeller (bayat kilit devralınır)."""
+    path = _gui_lock_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError:
+        return True          # kilit kurulamıyorsa arayüzü engelleme
+    try:
+        with open(path, encoding="utf-8") as f:
+            other = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        other = 0
+    if other and other != os.getpid() and pid_alive(other):
+        return False
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        return True
+    return True
+
+
+def _release_gui_lock() -> None:
+    path = _gui_lock_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            if int(f.read().strip() or 0) != os.getpid():
+                return
+        os.remove(path)
+    except (OSError, ValueError):
+        pass
+
+
 def run() -> None:
-    _load_css()
-    win = AppWindow()
-    win.show_all()
-    Gtk.main()
+    if not _acquire_gui_lock():
+        print("mebbypass arayüzü zaten açık.", file=sys.stderr)
+        print("Açık pencereyi kullanın ya da tepsi simgesine tıklayın.",
+              file=sys.stderr)
+        return
+    try:
+        _load_css()
+        win = AppWindow()
+        win.show_all()
+        Gtk.main()
+    finally:
+        _release_gui_lock()

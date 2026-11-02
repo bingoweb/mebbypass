@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"
+     viewBox="0 0 128 128">
+  <title>mebbypass</title>
+  <rect x="4" y="4" width="120" height="120" rx="24" ry="24"
+        fill="#1f3a5f"/>
+  <path d="M64 18 L104 34 V66 C104 88 86 104 64 110 C42 104 24 88 24 66
+           V34 Z" fill="#2d5c8a"/>
+  <path d="M44 52 L64 78 L84 52" fill="none" stroke="#f5f7fa"
+        stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M36 88 H92" fill="none" stroke="#43c07a" stroke-width="8"
+        stroke-linecap="round"/>
+</svg>

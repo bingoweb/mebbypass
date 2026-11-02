@@ -25,7 +25,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = os.path.join(REPO, "mebbypass")
 PACK = os.path.join(REPO, "packaging")
 
-MODULES = ["__init__.py", "__main__.py", "core.py", "diagnosis.py", "gui.py"]
 PY_BASE = "usr/lib/python3/dist-packages/mebbypass"
 
 
@@ -35,6 +34,17 @@ def read_version() -> str:
     if not m:
         raise SystemExit("Sürüm mebbypass/__init__.py içinde bulunamadı")
     return m.group(1)
+
+
+def list_modules() -> list:
+    """Paketlenecek Python modülleri (depodaki gerçek dosyalardan).
+
+    Sabit liste tutmak, yeni bir modül eklendiğinde paketten sessizce
+    düşmesine yol açıyordu; bu yüzden dizin taranır.
+    """
+    names = [f for f in sorted(os.listdir(PKG))
+             if f.endswith(".py") and os.path.isfile(os.path.join(PKG, f))]
+    return names or ["__init__.py"]
 
 
 def _read(path: str) -> bytes:
@@ -90,10 +100,13 @@ def build(out_dir: str) -> str:
         "usr/lib", "usr/lib/python3", "usr/lib/python3/dist-packages",
         "usr/lib/python3/dist-packages/mebbypass",
         "usr/share", "usr/share/applications",
+        "usr/share/icons", "usr/share/icons/hicolor",
+        "usr/share/icons/hicolor/scalable",
+        "usr/share/icons/hicolor/scalable/apps",
         "usr/share/doc", "usr/share/doc/mebbypass",
     ]
     data_files = []
-    for m in MODULES:
+    for m in list_modules():
         data_files.append((PY_BASE + "/" + m,
                            _read(os.path.join(PKG, m)), 0o644))
     launcher = "#!/bin/sh\nexec python3 -X utf8 -m mebbypass \"$@\"\n"
@@ -104,6 +117,8 @@ def build(out_dir: str) -> str:
                        _read(os.path.join(REPO, "mebbypass-dur.sh")), 0o755))
     data_files.append(("usr/share/applications/mebbypass.desktop",
                        _read(os.path.join(PACK, "mebbypass.desktop")), 0o644))
+    data_files.append(("usr/share/icons/hicolor/scalable/apps/mebbypass.svg",
+                       _read(os.path.join(PACK, "mebbypass.svg")), 0o644))
     data_files.append(("usr/share/doc/mebbypass/README.md",
                        _read(os.path.join(REPO, "README.md")), 0o644))
     data_files.append(("usr/share/doc/mebbypass/copyright",

@@ -22,11 +22,12 @@ Test:  curl -x http://127.0.0.1:8080 https://www.youtube.com
 """
 
 import argparse
+import signal
 import sys
 import time
 
-from .core import (DEFAULT_PORT, LISTEN_HOST, LOG_FILE, Server, log,
-                   run_self_test, set_system)
+from .core import (DEFAULT_PORT, LISTEN_HOST, LOG_FILE, AlreadyRunning,
+                   Server, log, run_self_test, set_system)
 
 
 def main() -> None:
@@ -92,6 +93,12 @@ def main() -> None:
     server = Server(port=requested, chunk=args.chunk, auto=auto_port)
     try:
         server.start()
+    except AlreadyRunning as e:
+        print("mebbypass zaten çalışıyor (PID %d)." % e.pid, file=sys.stderr)
+        print("Durdurmak için: mebbypass-dur.sh stop", file=sys.stderr)
+        # 3: "zaten çalışıyor" — systemd birimi bu kodu hata saymaz
+        # (RestartPreventExitStatus=3), yoksa açılışta sonsuz döngü olur.
+        sys.exit(3)
     except OSError as e:
         print(f"Hata: porta bağlanılamadı: {e}", file=sys.stderr)
         sys.exit(1)
@@ -122,13 +129,31 @@ def main() -> None:
           "'--sistem --geri-al')")
     print("-" * 60)
 
+    # systemd/SIGTERM ile kapatıldığında da masaüstü proxy ayarları geri
+    # alınmalı; aksi hâlde tahtada ölü bir proxy adresi kalır.
+    def _sinyal(_signum, _frame):
+        raise SystemExit(0)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _sinyal)
+            except (OSError, ValueError):
+                pass
+
     try:
         while server.running:
             time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nKapatılıyor...")
+    except SystemExit:
+        print("\nSinyal alındı, kapatılıyor...")
     finally:
         server.stop()
+        if args.sistem:
+            set_system(server.port, on=False)
+            print("Sistem proxy ayarları geri alındı.")
 
 
 if __name__ == "__main__":
